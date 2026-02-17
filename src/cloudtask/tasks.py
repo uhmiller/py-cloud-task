@@ -1,8 +1,9 @@
+import inspect
 import json
 from datetime import datetime
 from functools import wraps
 from logging import getLogger
-from typing import Any, Callable, Generic, ParamSpec, TypeVar
+from typing import Any, Callable, Coroutine, Generic, ParamSpec, TypeVar
 from zoneinfo import ZoneInfo
 
 from google.cloud import tasks_v2
@@ -17,7 +18,7 @@ R = TypeVar("R")
 logger = getLogger("cloudtask")
 
 
-class Task(Generic[R]):
+class Task(Generic[P, R]):
     """
     Represents a task wrapper that captures the function and its arguments,
     ready to be executed locally or pushed to Google Cloud Tasks.
@@ -26,7 +27,7 @@ class Task(Generic[R]):
     def __init__(
         self,
         client: "CloudTaskClient",
-        func: Callable[..., R],
+        func: Callable[P, R],
         func_args: tuple,
         func_kwargs: dict,
         queue: str,
@@ -62,11 +63,13 @@ class Task(Generic[R]):
         self._func_args = func_args
         self._func_kwargs = func_kwargs
 
-    def __call__(self) -> R:
+        self._is_coroutine = inspect.iscoroutinefunction(func)
+
+    def __call__(self) -> R | Coroutine[Any, Any, R]:
         """Allows the task instance to be called directly like the original function."""
         return self.execute()
 
-    def execute(self) -> R:
+    def execute(self) -> R | Coroutine[Any, Any, R]:
         """
         Executes the task immediately in the current process.
 
@@ -82,84 +85,116 @@ class Task(Generic[R]):
         )
         return self._func(*self._func_args, **self._func_kwargs)
 
-    def delay(self) -> str | None:
+    async def push(self, at: datetime | None = None) -> str | None:
         """
-        Pushes the task to Google Cloud Tasks for immediate execution.
-
-        Returns:
-            str | None: The fully qualified task name if pushed, or None if executed eagerly.
+        Async push to Cloud Tasks. (Non-blocking IO)
+        Recommended for FastAPI and Async Contexts.
         """
-        return self._push()
-
-    def schedule(self, at: datetime) -> str | None:
-        """
-        Schedules the task to be executed at a specific future time.
-
-        Args:
-            at (datetime): The specific time to run the task.
-
-        Returns:
-            str | None: The fully qualified task name if scheduled, or None if executed eagerly.
-        """
-        return self._push(schedule_time=at)
-
-    # Alias for delay, common in other queuing systems
-    push = delay
-
-    def _push(self, schedule_time: datetime | None = None) -> str | None:
-        """Internal method to handle the logic of sending the task to GCP."""
-
-        # 1. Eager Mode Check
+        # Eager Mode (Local Dev)
         if self._client.eager:
-            logger.info(
-                f"Eager mode enabled. Running task '{self._func.__name__}' locally."
-            )
-            self.execute()
-            return "local-execution"
+            logger.info(f"[Eager-Async] Running '{self._func.__name__}' locally.")
+            if self._is_coroutine:
+                await self.execute()
+            else:
+                self.execute()
+            return None
 
-        task_payload = self._build_task_payload()
+        payload = self._build_task_request_payload(schedule_time=at)
 
-        # 2. Schedule Time Handling
-        if schedule_time:
-            # If datetime is naive (no timezone), apply the client's default timezone
-            if schedule_time.tzinfo is None:
-                logger.debug(
-                    f"Received naive datetime for schedule. Applying client timezone: {self._client.timezone}"
-                )
-                schedule_time = schedule_time.replace(tzinfo=self._client.timezone)
-
-            timestamp = timestamp_pb2.Timestamp()
-            timestamp.FromDatetime(schedule_time)
-            task_payload["schedule_time"] = timestamp
-
-            logger.info(
-                f"Scheduling task '{self._func.__name__}' for {schedule_time} on queue '{self.queue}'."
-            )
-        else:
-            logger.info(
-                f"Pushing task '{self._func.__name__}' to queue '{self.queue}'..."
-            )
-
-        # 3. API Call to Google
+        # Send via Async Client (gRPC aio)
         try:
-            response = self._client.service.create_task(
-                request={
-                    "parent": self.queue_path,
-                    "task": task_payload,
-                }
-            )
-            logger.info(f"Task successfully created: {response.name}")
+            response = await self._client.service.create_task(request=payload)
+            logger.info(f"Task created (Async): {response.name}")
             return response.name
         except Exception as e:
-            logger.error(
-                f"Failed to push task '{self._func.__name__}' to queue '{self.queue}'. Error: {str(e)}",
-                exc_info=True,
-            )
-            raise exceptions.CloudTaskException(
-                f"Failed to push task '{self._func.__name__}' to queue '{self.queue}'. Error: {str(e)}"
+            self._handle_error(e)
+
+    delay = push
+
+    def sync_push(self, schedule_time: datetime | None = None) -> str | None:
+        """
+        Synchronous blocking push to Cloud Tasks.
+        Use this ONLY in synchronous contexts (e.g., legacy Django views).
+        """
+
+        if self._client.eager:
+            logger.info(f"[Eager-Sync] Running '{self._func.__name__}' locally.")
+            if self._is_coroutine:
+                logger.warning(
+                    f"Task '{self._func.__name__}' is async but called via push_sync in eager mode. "
+                    "You might need to await the result or use task.push() instead."
+                )
+            self.execute()  # type: ignore
+            return None
+
+        payload = self._build_task_request_payload(schedule_time)
+
+        try:
+            response = self._client.sync_service.create_task(request=payload)
+            logger.info(f"Task created (Sync): {response.name}")
+            return response.name
+        except Exception as e:
+            self._handle_error(e)
+
+    sync_delay = sync_push
+
+    # ---------------------
+
+    async def remote(self, url: str | None = None) -> Any:
+        """
+        Simulates the Google Cloud Task execution by making a direct HTTP POST request
+        to the worker URL using 'httpx'.
+
+        This bypasses Google Cloud infrastructure but tests the full HTTP/Serialization flow.
+
+        Args:
+            url (str | None): Override the task URL (useful if testing locally on a different port).
+
+        Returns:
+            Any: The JSON response from the worker.
+
+        Raises:
+            ImportError: If 'httpx' is not installed.
+            Exception: If the worker returns a non-200 status.
+        """
+        try:
+            import httpx
+        except ImportError:
+            raise ImportError(
+                "The 'httpx' library is required for local remote simulation. "
+                "Install it with: uv add httpx"
             )
 
-    def _build_task_payload(self) -> dict:
+        target_url = url or self.url
+        payload = self.data
+        headers = self.headers
+
+        logger.info(f"⚡ Simulating remote task: {self._func.__name__} -> {target_url}")
+
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.post(
+                    target_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=self.timeout or 10.0,
+                )
+
+                response.raise_for_status()
+                return response.json()
+
+            except httpx.HTTPStatusError as e:
+                logger.error(
+                    f"Remote task failed with status {e.response.status_code}: {e.response.text}"
+                )
+                raise e
+            except Exception as e:
+                logger.error(f"Failed to connect to worker: {str(e)}")
+                raise e
+
+    # ----------------------
+
+    def _build_task_request_payload(self, schedule_time: datetime | None) -> dict:
         """Constructs the dictionary payload expected by Google Cloud Tasks API."""
 
         # Encoding payload to JSON bytes
@@ -188,7 +223,29 @@ class Task(Generic[R]):
             duration.FromSeconds(self.timeout)
             task["dispatch_deadline"] = duration
 
-        return task
+        # Scheduling
+        if schedule_time:
+            # If datetime is naive (no timezone), apply the client's default timezone
+            if schedule_time.tzinfo is None:
+                logger.debug(
+                    f"Received naive datetime for schedule. Applying client timezone: {self._client.timezone}"
+                )
+                schedule_time = schedule_time.replace(tzinfo=self._client.timezone)
+
+            timestamp = timestamp_pb2.Timestamp()
+            timestamp.FromDatetime(schedule_time)
+            task["schedule_time"] = timestamp
+
+        return {
+            "parent": self.queue_path,
+            "task": task,
+        }
+
+    def _handle_error(self, e: Exception):
+        logger.error(
+            f"Failed to push task '{self._func.__name__}'. Error: {e}", exc_info=True
+        )
+        raise exceptions.CloudTaskException(str(e))
 
     @property
     def data(self) -> dict[str, Any]:
@@ -219,6 +276,10 @@ class Task(Generic[R]):
         self._headers.update(headers)
 
     @property
+    def is_coroutine(self) -> bool:
+        return self._is_coroutine
+
+    @property
     def path(self) -> str:
         """Returns the fully qualified dot-path of the function."""
         return self._func_path
@@ -229,7 +290,7 @@ class Task(Generic[R]):
         if self._client.eager or not self.name:
             return None
 
-        return self._client.service.task_path(
+        return self._client.service_utils.task_path(
             self._client.project,
             self._client.location,
             self.queue,
@@ -242,7 +303,7 @@ class Task(Generic[R]):
         if self._client.eager:
             return None
 
-        return self._client.service.queue_path(
+        return self._client.service_utils.queue_path(
             self._client.project,
             self._client.location,
             self.queue,
@@ -293,14 +354,14 @@ class CloudTaskClient:
         self.secret = secret
         self.secret_header_name = secret_header_name
 
-        # Initialize Google Cloud Client (Lazy load if eager to avoid credentials error locally)
-        self.service = tasks_v2.CloudTasksClient() if not eager else None
-
         # Timezone Configuration
         if isinstance(timezone, str):
             self.timezone = ZoneInfo(timezone)
         else:
             self.timezone = timezone or ZoneInfo("UTC")
+
+        self._sync_client = None
+        self._async_client = None
 
         logger.debug(
             f"CloudTaskClient initialized. Eager: {eager}, Timezone: {self.timezone}"
@@ -313,7 +374,7 @@ class CloudTaskClient:
         url: str | None = None,
         timeout: int | None = None,
         headers: dict[str, str] | None = None,
-    ) -> Callable[[Callable[P, R]], Callable[P, Task[R]]]:
+    ) -> Callable[[Callable[P, R]], Callable[P, Task[P, R]]]:
         """
         Decorator to convert a function into a Cloud Task.
 
@@ -328,9 +389,9 @@ class CloudTaskClient:
             Callable: The decorated function which returns a Task object when called.
         """
 
-        def decorator(func: Callable[P, R]) -> Callable[P, Task[R]]:
+        def decorator(func: Callable[P, R]) -> Callable[P, Task[P, R]]:
             @wraps(func)
-            def inner(*args: P.args, **kwargs: P.kwargs) -> Task[R]:
+            def inner(*args: P.args, **kwargs: P.kwargs) -> Task[P, R]:
                 return Task(
                     func=func,
                     func_args=args,
@@ -346,3 +407,27 @@ class CloudTaskClient:
             return inner
 
         return decorator
+
+    @property
+    def sync_service(self):
+        """Lazy load synchronous client (google.cloud.tasks_v2.CloudTasksClient)"""
+        if self.eager:
+            return None
+
+        if not self._sync_client:
+            self._sync_client = tasks_v2.CloudTasksClient()
+        return self._sync_client
+
+    @property
+    def service(self):
+        """Lazy load ASYNC client (google.cloud.tasks_v2.CloudTasksAsyncClient)"""
+        if self.eager:
+            return None
+        if not self._async_client:
+            self._async_client = tasks_v2.CloudTasksAsyncClient()
+        return self._async_client
+
+    @property
+    def service_utils(self):
+        """Helper to access paths (can use either client class, they share helpers)"""
+        return tasks_v2.CloudTasksClient

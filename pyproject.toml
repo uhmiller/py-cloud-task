@@ -21,6 +21,14 @@ dependencies = [
     "ruff>=0.15.1",
 ]
 
+[project.optional-dependencies]
+fastapi = [
+    "fastapi>=0.129.0",
+]
+test = [
+    "httpx>=0.28.1",
+]
+
 [build-system]
 requires = ["uv_build>=0.9.29,<0.10.0"]
 build-backend = "uv_build"
