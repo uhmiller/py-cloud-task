@@ -1,5 +1,6 @@
 [project]
 name = "py-cloud-task"
+
 version = "0.1.0"
 description = "A framework agnostic Google Cloud Tasks library for the Push architecture."
 readme = "README.md"
@@ -17,8 +18,18 @@ classifiers = [
 ]
 dependencies = [
     "google-cloud-tasks>=2.21.0",
+    "ruff>=0.15.1",
 ]
 
 [build-system]
 requires = ["uv_build>=0.9.29,<0.10.0"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "cloudtask"
+module-root = "src"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.1",
+]

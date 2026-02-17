@@ -1,11 +1,3 @@
-<p align="center">
-  <a href="https://ziett.com">
-    <img src="https://ziett.co/icon.png" alt="Ziett Logo" width="60" height="60"/>
-  </a>
-  <br>
-  <span style="color: #666;">Built with ❤️ by the engineering team at <a href="https://ziett.co">Ziett</a></span>
-</p>
-
 <h1 align="center">py-cloud-task</h1>
 
 <p align="center">
@@ -41,4 +33,12 @@ It abstracts the complexity of the Google Cloud API and provides a developer exp
 
 ---
 
-## 📦 Package in development...
+### 📦 Package in development...
+
+<p align="center">
+  <a href="https://ziett.com">
+    <img src="https://ziett.co/icon.png" alt="Ziett Logo" width="60" height="60"/>
+  </a>
+  <br>
+  <span style="color: #666;">Built with ❤️ by the engineering team at <a href="https://ziett.co">Ziett</a></span>
+</p>
