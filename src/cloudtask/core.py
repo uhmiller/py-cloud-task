@@ -306,7 +306,7 @@ class Task(Generic[P, R]):
         return self._client.service_utils.queue_path(
             self._client.project,
             self._client.location,
-            self.queue,
+            self._client.force_to_queue or self.queue,
         )
 
 
@@ -328,6 +328,7 @@ class CloudTaskClient:
         secret: str = "",
         secret_header_name: str = "X-PYCT-SECRET",
         timezone: str | ZoneInfo | None = None,
+        force_to_queue: str | None = None,
     ):
         """
         Initializes the CloudTaskClient.
@@ -343,6 +344,7 @@ class CloudTaskClient:
             secret (str, optional): A shared secret/token to send in headers for security. Defaults to "".
             secret_header_name (str, optional): The header name for the secret. Defaults to "X-PYCT-SECRET".
             timezone (str | ZoneInfo | None, optional): Default timezone for scheduling. Defaults to UTC.
+            force_to_queue (str | NOne, optional): Usefull for dev and staging env, to for use the same queue
         """
         self.queue = queue
         self.location = location
@@ -353,6 +355,7 @@ class CloudTaskClient:
         self.timeout = timeout
         self.secret = secret
         self.secret_header_name = secret_header_name
+        self.force_to_queue = force_to_queue
 
         # Timezone Configuration
         if isinstance(timezone, str):

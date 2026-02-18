@@ -1,3 +1,3 @@
-from cloudtask.tasks import CloudTaskClient, Task
+from cloudtask.core import CloudTaskClient, Task
 
 __all__ = ["CloudTaskClient", "Task"]
