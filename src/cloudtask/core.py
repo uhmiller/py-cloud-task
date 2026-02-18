@@ -173,7 +173,7 @@ class Task(Generic[P, R]):
             )
 
         target_url = url or self.url
-        payload = self.data
+        payload = json.dumps(self.data, cls=CloudTaskJSONEncoder).encode("utf-8")
         headers = self.headers
 
         logger.info(f"⚡ Remote task: {self._func.__name__} -> {target_url}")
@@ -182,7 +182,7 @@ class Task(Generic[P, R]):
             try:
                 response = await client.post(
                     target_url,
-                    json=payload,
+                    content=payload,
                     headers=headers,
                     timeout=self.timeout or 10.0,
                 )
@@ -225,7 +225,7 @@ class Task(Generic[P, R]):
             )
 
         target_url = url or self.url
-        payload = self.data
+        payload = json.dumps(self.data, cls=CloudTaskJSONEncoder).encode("utf-8")
         headers = self.headers
 
         logger.info(f"⚡ Remote task: {self._func.__name__} -> {target_url}")
@@ -234,7 +234,7 @@ class Task(Generic[P, R]):
             try:
                 response = client.post(
                     target_url,
-                    json=payload,
+                    content=payload,
                     headers=headers,
                     timeout=self.timeout or 10.0,
                 )
