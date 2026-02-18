@@ -184,7 +184,7 @@ class Task(Generic[P, R]):
                     target_url,
                     content=payload,
                     headers=headers,
-                    timeout=self.timeout or 10.0,
+                    timeout=self.timeout,
                 )
 
                 response.raise_for_status()
@@ -236,7 +236,7 @@ class Task(Generic[P, R]):
                     target_url,
                     content=payload,
                     headers=headers,
-                    timeout=self.timeout or 10.0,
+                    timeout=self.timeout,
                 )
 
                 response.raise_for_status()
