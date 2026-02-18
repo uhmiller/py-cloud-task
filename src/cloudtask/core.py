@@ -3,7 +3,7 @@ import json
 from datetime import datetime
 from functools import wraps
 from logging import getLogger
-from typing import Any, Callable, Coroutine, Generic, ParamSpec, TypeVar
+from typing import Any, Callable, Coroutine, Generic, Literal, ParamSpec, TypeVar
 from zoneinfo import ZoneInfo
 
 from google.cloud import tasks_v2
@@ -92,12 +92,16 @@ class Task(Generic[P, R]):
         """
         # Eager Mode (Local Dev)
         if self._client.eager:
-            logger.info(f"[Eager-Async] Running '{self._func.__name__}' locally.")
-            if self._is_coroutine:
-                await self.execute()
-            else:
-                self.execute()
-            return None
+            if self._client.eager == "immediate":
+                logger.info(f"[Eager-Async] Running '{self._func.__name__}' locally.")
+                if self._is_coroutine:
+                    await self.execute()
+                else:
+                    self.execute()
+                return None
+            elif self._client.eager == "remote":
+                await self._remote()
+                return None
 
         payload = self._build_task_request_payload(schedule_time=at)
 
@@ -118,14 +122,18 @@ class Task(Generic[P, R]):
         """
 
         if self._client.eager:
-            logger.info(f"[Eager-Sync] Running '{self._func.__name__}' locally.")
-            if self._is_coroutine:
-                logger.warning(
-                    f"Task '{self._func.__name__}' is async but called via push_sync in eager mode. "
-                    "You might need to await the result or use task.push() instead."
-                )
-            self.execute()  # type: ignore
-            return None
+            if self._client.eager == "immediate":
+                logger.info(f"[Eager-Sync] Running '{self._func.__name__}' locally.")
+                if self._is_coroutine:
+                    logger.warning(
+                        f"Task '{self._func.__name__}' is async but called via push_sync in eager mode. "
+                        "You might need to await the result or use task.push() instead."
+                    )
+                self.execute()  # type: ignore
+                return None
+            elif self._client.eager == "remote":
+                self._remote_sync()
+                return None
 
         payload = self._build_task_request_payload(schedule_time)
 
@@ -138,9 +146,7 @@ class Task(Generic[P, R]):
 
     sync_delay = sync_push
 
-    # ---------------------
-
-    async def remote(self, url: str | None = None) -> Any:
+    async def _remote(self, url: str | None = None) -> Any:
         """
         Simulates the Google Cloud Task execution by making a direct HTTP POST request
         to the worker URL using 'httpx'.
@@ -169,7 +175,7 @@ class Task(Generic[P, R]):
         payload = self.data
         headers = self.headers
 
-        logger.info(f"⚡ Simulating remote task: {self._func.__name__} -> {target_url}")
+        logger.info(f"⚡ Remote task: {self._func.__name__} -> {target_url}")
 
         async with httpx.AsyncClient() as client:
             try:
@@ -192,7 +198,57 @@ class Task(Generic[P, R]):
                 logger.error(f"Failed to connect to worker: {str(e)}")
                 raise e
 
-    # ----------------------
+    def _remote_sync(self, url: str | None = None) -> Any:
+        """
+        Simulates the Google Cloud Task execution by making a direct HTTP POST request
+        to the worker URL using 'httpx'.
+
+        This bypasses Google Cloud infrastructure but tests the full HTTP/Serialization flow.
+
+        Args:
+            url (str | None): Override the task URL (useful if testing locally on a different port).
+
+        Returns:
+            Any: The JSON response from the worker.
+
+        Raises:
+            ImportError: If 'httpx' is not installed.
+            Exception: If the worker returns a non-200 status.
+        """
+        try:
+            import httpx
+        except ImportError:
+            raise ImportError(
+                "The 'httpx' library is required for local remote simulation. "
+                "Install it with: uv add httpx"
+            )
+
+        target_url = url or self.url
+        payload = self.data
+        headers = self.headers
+
+        logger.info(f"⚡ Remote task: {self._func.__name__} -> {target_url}")
+
+        with httpx.Client() as client:
+            try:
+                response = client.post(
+                    target_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=self.timeout or 10.0,
+                )
+
+                response.raise_for_status()
+                return response.json()
+
+            except httpx.HTTPStatusError as e:
+                logger.error(
+                    f"Remote task failed with status {e.response.status_code}: {e.response.text}"
+                )
+                raise e
+            except Exception as e:
+                logger.error(f"Failed to connect to worker: {str(e)}")
+                raise e
 
     def _build_task_request_payload(self, schedule_time: datetime | None) -> dict:
         """Constructs the dictionary payload expected by Google Cloud Tasks API."""
@@ -245,7 +301,7 @@ class Task(Generic[P, R]):
         logger.error(
             f"Failed to push task '{self._func.__name__}'. Error: {e}", exc_info=True
         )
-        raise exceptions.CloudTaskException(str(e))
+        raise exceptions.TaskPushError(str(e))
 
     @property
     def data(self) -> dict[str, Any]:
@@ -323,12 +379,12 @@ class CloudTaskClient:
         location: str,
         url: str,
         sae: str,
-        eager: bool = False,
         timeout: int | None = None,
         secret: str = "",
         secret_header_name: str = "X-PYCT-SECRET",
         timezone: str | ZoneInfo | None = None,
         force_to_queue: str | None = None,
+        eager: None | Literal["remote", "immediate"] = None,
     ):
         """
         Initializes the CloudTaskClient.

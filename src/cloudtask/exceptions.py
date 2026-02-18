@@ -20,3 +20,9 @@ class TaskExecutionError(CloudTaskException):
     """Raised when the task function fails during execution."""
 
     pass
+
+
+class TaskPushError(CloudTaskException):
+    """Raised when an error occurs while pushing task to queue."""
+
+    pass

@@ -68,12 +68,13 @@ client = CloudTaskClient(
     project="my-gcp-project",
     location="europe-west1",
     queue="default",
-    url="https://public.app.com/tasks",  # The public URL of your worker
+    url="[https://api.myapp.com/tasks/run](https://api.myapp.com/tasks/run)",  # The public URL of your worker
     sae="my-service-account@my-gcp-project.iam.gserviceaccount.com",  # Service Account email for OIDC auth
     secret="super-secret-token",  # Optional: Header secret for extra security
-    force_to_queue=None,  # set the name of queue to ingnore all conf and push only to this queue name
-    eager=Fale,  # set True to execute task immediately without push to Google Cloud Tasks
+    force_to_queue=None,  # Optional: Force all tasks to a specific queue (useful for Staging)
+    eager=None,  # None = Production (Sends to Google Cloud)
 )
+
 ```
 
 ### 2. Define a Task
@@ -81,7 +82,7 @@ client = CloudTaskClient(
 Use the `@client.task` decorator. You can define tasks anywhere in your code.
 
 ```python
-@client.task(queue='other', name='uniquename')
+@client.task(queue='high-priority', name='unique-task-name')
 async def send_welcome_email(user_id: str, email: str):
     print(f"Sending email to {email}...")
     # ... logic to send email ...
@@ -134,31 +135,37 @@ await task.push()
 
 ```
 
-### Local Development (Eager Mode)
+### Local Development (Eager Modes)
 
-When developing locally, you often don't want to send tasks to Google Cloud. Use `eager=True` to execute tasks
-immediately in the current process.
+When developing locally, you often don't want to send tasks to Google Cloud. The `eager` parameter supports three modes
+to help you develop and test safely.
+
+#### Mode 1: Immediate Execution (`eager="immediate"`)
+
+Runs the function directly in the current process. Fastest option for Unit Tests.
 
 ```python
-# In your local config
-client = CloudTaskClient(..., eager=True)
-
-# This will run the function immediately (awaitable) without calling Google
+client = CloudTaskClient(..., eager="immediate")
 await send_welcome_email("123", "user@example.com").push()
+# Result: Function runs instantly. No HTTP. No Serialization.
 
 ```
 
-### Local Integration Testing (Remote Simulation)
+#### Mode 2: Remote Simulation (`eager="remote"`)
 
-If you want to test the full HTTP flow (serialization -> HTTP request -> worker execution) without Google Cloud
-infrastructure, use `.remote()`. This requires `httpx`.
+Simulates a full HTTP request to your local worker using `httpx`. This is perfect for **Integration Tests** because it
+validates serialization, headers, and dependency injection without needing Google infrastructure.
 
 ```python
-# Simulate a request to your local running worker
-# This bypasses Google but tests your Router and Dependencies
-await send_welcome_email("123", "user@example.com").remote(url="http://localhost:8000/tasks/run")
+client = CloudTaskClient(..., eager="remote")
+await send_welcome_email("123", "user@example.com").push()
+# Result: Sends POST http://localhost:8000/tasks/run.
 
 ```
+
+#### Mode 3: Production (`eager=None`)
+
+The default behavior. Serializes the task and sends it to Google Cloud Tasks.
 
 ---
 
@@ -171,13 +178,12 @@ await send_welcome_email("123", "user@example.com").remote(url="http://localhost
 ```python
 from fastapi import FastAPI
 from cloudtask.fastapi import CloudTaskRouter
-
-from app.core.tasks import ct as ct_client
+from app.core.tasks import client
 
 app = FastAPI()
 
 # Register the route that receives tasks from Google
-app.include_router(CloudTaskRouter(ct_client), prefix="/tasks")
+app.include_router(CloudTaskRouter(client), prefix="/tasks")
 
 ```
 
@@ -189,13 +195,11 @@ endpoints.
 ```python
 from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.core.tasks import ct
 from app.core.db import get_db
 
 
-@ct.task()
-async def task_process_order(
+@client.task()
+async def process_order(
         order_id: int,
         db: AsyncSession = Depends(get_db)  # <--- Magic happens here
 ):
@@ -206,7 +210,8 @@ async def task_process_order(
 
 ```
 
-**Note:** When triggering the task, you **only** pass the data arguments. The dependencies are resolved by the worker.
+**Note:** When triggering the task, you **only** pass the data arguments. The dependencies are resolved automatically by
+the worker.
 
 ```python
 # Correct usage (Dependency is ignored during push)
@@ -221,7 +226,7 @@ await process_order(order_id=500).push()
 To ensure that only Google Cloud Tasks can call your worker endpoint, the library supports two mechanisms:
 
 1. **OIDC Token (Recommended):** The library automatically attaches an OIDC token identifying the Service Account. Your
-   Cloud Run/Functions service should validates this token (Google handles this automatically for Cloud Run if you don't
+   Cloud Run/Functions service should validate this token (Google handles this automatically for Cloud Run if you don't
    allow unauthenticated invocations).
 2. **Secret Header:** You can configure a shared secret.
 
@@ -239,6 +244,14 @@ The router will automatically validate the `X-PYCT-SECRET` header and reject una
 Contributions are welcome! If you find a bug or want to add a feature (e.g., Flask or Django adapters), please open an
 issue or submit a PR.
 
+---
+
 <p align="center">
 <span style="color: #666;">Built with ❤️ by the engineering team at <a href="https://ziett.co">Ziett</a></span>
+</p>
+
+<p align="center">
+<a href="https://ziett.com">
+<img src="https://ziett.co/icon.png" alt="Ziett Logo" width="60" height="60"/>
+</a>
 </p>
