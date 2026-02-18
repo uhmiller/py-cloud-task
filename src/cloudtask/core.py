@@ -10,6 +10,7 @@ from google.cloud import tasks_v2
 from google.protobuf import duration_pb2, timestamp_pb2
 
 from cloudtask import exceptions
+from cloudtask.encoder import CloudTaskJSONEncoder
 
 # Type aliases for better readability in decorators
 P = ParamSpec("P")
@@ -254,7 +255,7 @@ class Task(Generic[P, R]):
         """Constructs the dictionary payload expected by Google Cloud Tasks API."""
 
         # Encoding payload to JSON bytes
-        json_body = json.dumps(self.data).encode("utf-8")
+        json_body = json.dumps(self.data, cls=CloudTaskJSONEncoder).encode("utf-8")
 
         http_request = {
             "http_method": tasks_v2.HttpMethod.POST,
