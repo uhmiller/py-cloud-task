@@ -1,4 +1,5 @@
 import inspect
+import logging
 from contextlib import AsyncExitStack
 from typing import Any, Callable
 
@@ -9,6 +10,8 @@ from pydantic import BaseModel
 
 from cloudtask import CloudTaskClient, exceptions
 from cloudtask.executor import CloudTaskExecutor
+
+logger = logging.getLogger("cloudtask.fastapi")
 
 
 class TaskRequestBody(BaseModel):
@@ -46,6 +49,15 @@ class FastAPICloudTaskExecutor(CloudTaskExecutor):
         dependant.query_params = [
             p for p in dependant.query_params if p.name not in provided_params
         ]
+        dependant.header_params = [
+            p for p in dependant.header_params if p.name not in provided_params
+        ]
+        dependant.cookie_params = [
+            p for p in dependant.cookie_params if p.name not in provided_params
+        ]
+        dependant.body_params = [
+            p for p in dependant.body_params if p.name not in provided_params
+        ]
 
         # dependencies resolution
         async with AsyncExitStack() as stack:
@@ -58,15 +70,15 @@ class FastAPICloudTaskExecutor(CloudTaskExecutor):
                 embed_body_fields=False,
             )
 
+            if solved_result.errors:
+                error_msg = f"Dependency resolution failed for '{func.__name__}': {solved_result.errors}"
+                logger.error(error_msg)
+                raise exceptions.TaskExecutionError(error_msg)
+
             # merge task kwargs and resolved dependencies
             # priority for dependencies
             task_kwargs = kwargs.copy()
             task_kwargs.update(solved_result.values)
-
-            if solved_result.errors:
-                raise exceptions.TaskExecutionError(
-                    f"Dependency resolution failed: {solved_result.errors}"
-                )
 
             return await super()._execute_impl(func, args, task_kwargs)
 
