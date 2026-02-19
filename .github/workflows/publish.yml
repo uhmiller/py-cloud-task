@@ -1,0 +1,43 @@
+name: Publish to PyPI
+
+# Este workflow só vai rodar quando criares uma nova Release no GitHub
+# ou quando fizeres push de uma tag (ex: git tag v1.0.0 && git push --tags)
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-publish:
+    name: Build and Publish to PyPI
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write  # Necessário para o PyPI confiar no GitHub
+      contents: read   # Necessário para fazer o checkout do código
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: "pyproject.toml"
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      #      - name: Run Tests
+      #        run: uv run pytest tests/
+
+      - name: Build Package
+        run: uv build
+
+      - name: Publish to PyPI
+        run: uv publish
