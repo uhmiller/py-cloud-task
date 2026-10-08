@@ -1,5 +1,7 @@
+import asyncio
 import inspect
 import json
+import threading
 from collections.abc import Callable, Coroutine
 from datetime import datetime
 from functools import wraps
@@ -157,22 +159,16 @@ class Task(Generic[P, R]):
             return f"{self.url.rstrip('/')}/{self._func.__name__}"
         return self.url
 
-    async def _remote(self, url: str | None = None) -> Any:
+    async def _remote(self, url: str | None = None) -> None:
         """
-        Simulates the Google Cloud Task execution by making a direct HTTP POST request
-        to the worker URL using 'httpx'.
-
-        This bypasses Google Cloud infrastructure but tests the full HTTP/Serialization flow.
+        Simulates Google Cloud Task execution by firing an HTTP POST request
+        to the worker URL in the background without waiting for the execution response.
 
         Args:
             url (str | None): Override the task URL (useful if testing locally on a different port).
 
-        Returns:
-            Any: The JSON response from the worker.
-
         Raises:
             ImportError: If 'httpx' is not installed.
-            Exception: If the worker returns a non-200 status.
         """
         try:
             import httpx
@@ -186,45 +182,33 @@ class Task(Generic[P, R]):
         payload = json.dumps(self.data, cls=CloudTaskJSONEncoder).encode("utf-8")
         headers = self.headers
 
-        logger.info(f"⚡ Remote task: {self._func.__name__} -> {target_url}")
+        logger.info(f"⚡ Remote task dispatched: {self._func.__name__} -> {target_url}")
 
-        async with httpx.AsyncClient() as client:
+        async def _send():
             try:
-                response = await client.post(
-                    target_url,
-                    content=payload,
-                    headers=headers,
-                    timeout=self.timeout,
-                )
-
-                response.raise_for_status()
-                return response.json()
-
-            except httpx.HTTPStatusError as e:
-                logger.error(
-                    f"Remote task failed with status {e.response.status_code}: {e.response.text}"
-                )
-                raise
+                async with httpx.AsyncClient() as client:
+                    await client.post(
+                        target_url,
+                        content=payload,
+                        headers=headers,
+                        timeout=self.timeout,
+                    )
             except Exception as e:
-                logger.error(f"Failed to connect to worker: {e!s}")
-                raise
+                logger.error(f"Failed to deliver remote task to worker: {e!s}")
 
-    def _remote_sync(self, url: str | None = None) -> Any:
+        # Agenda no event loop e retorna imediatamente
+        asyncio.create_task(_send())
+
+    def _remote_sync(self, url: str | None = None) -> None:
         """
-        Simulates the Google Cloud Task execution by making a direct HTTP POST request
-        to the worker URL using 'httpx'.
-
-        This bypasses Google Cloud infrastructure but tests the full HTTP/Serialization flow.
+        Simulates Google Cloud Task execution by firing an HTTP POST request
+        to the worker URL in a background thread without waiting for the execution response.
 
         Args:
             url (str | None): Override the task URL (useful if testing locally on a different port).
 
-        Returns:
-            Any: The JSON response from the worker.
-
         Raises:
             ImportError: If 'httpx' is not installed.
-            Exception: If the worker returns a non-200 status.
         """
         try:
             import httpx
@@ -238,28 +222,23 @@ class Task(Generic[P, R]):
         payload = json.dumps(self.data, cls=CloudTaskJSONEncoder).encode("utf-8")
         headers = self.headers
 
-        logger.info(f"⚡ Remote task: {self._func.__name__} -> {target_url}")
+        logger.info(f"⚡ Remote task dispatched: {self._func.__name__} -> {target_url}")
 
-        with httpx.Client() as client:
+        def _send():
             try:
-                response = client.post(
-                    target_url,
-                    content=payload,
-                    headers=headers,
-                    timeout=self.timeout,
-                )
-
-                response.raise_for_status()
-                return response.json()
-
-            except httpx.HTTPStatusError as e:
-                logger.error(
-                    f"Remote task failed with status {e.response.status_code}: {e.response.text}"
-                )
-                raise
+                with httpx.Client() as client:
+                    client.post(
+                        target_url,
+                        content=payload,
+                        headers=headers,
+                        timeout=self.timeout,
+                    )
             except Exception as e:
-                logger.error(f"Failed to connect to worker: {e!s}")
-                raise
+                logger.error(f"Failed to deliver remote task to worker: {e!s}")
+
+        # Executa na thread de segundo plano e retorna imediatamente
+        thread = threading.Thread(target=_send, daemon=True)
+        thread.start()
 
     def _build_task_request_payload(self, schedule_time: datetime | None) -> dict:
         """Constructs the dictionary payload expected by Google Cloud Tasks API."""

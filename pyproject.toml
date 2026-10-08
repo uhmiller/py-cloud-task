@@ -1,7 +1,7 @@
 [project]
 name = "py-cloud-task"
 
-version = "0.2.0"
+version = "0.2.1"
 description = "A framework agnostic Google Cloud Tasks library for the Push architecture."
 readme = "README.md"
 requires-python = ">=3.14"
