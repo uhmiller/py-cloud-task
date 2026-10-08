@@ -73,6 +73,7 @@ client = CloudTaskClient(
     secret="super-secret-token",  # Optional: Header secret for extra security
     force_to_queue=None,  # Optional: Force all tasks to a specific queue (useful for Staging)
     eager=None,  # None = Production (Sends to Google Cloud)
+    add_url_func_name_suffix=False # url = /tasks => /tasks/{task_func_name}
 )
 
 ```

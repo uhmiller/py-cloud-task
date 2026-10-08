@@ -1,9 +1,10 @@
 import inspect
 import json
+from collections.abc import Callable, Coroutine
 from datetime import datetime
 from functools import wraps
 from logging import getLogger
-from typing import Any, Callable, Coroutine, Generic, Literal, ParamSpec, TypeVar
+from typing import Any, Generic, Literal, ParamSpec, TypeVar
 from zoneinfo import ZoneInfo
 
 from google.cloud import tasks_v2
@@ -27,7 +28,7 @@ class Task(Generic[P, R]):
 
     def __init__(
         self,
-        client: "CloudTaskClient",
+        client: CloudTaskClient,
         func: Callable[P, R],
         func_args: tuple,
         func_kwargs: dict,
@@ -36,6 +37,7 @@ class Task(Generic[P, R]):
         name: str | None = None,
         timeout: int | None = None,
         headers: dict[str, str] | None = None,
+        add_url_func_name_suffix: bool = False,
     ):
         """
         Initializes the Task instance.
@@ -50,11 +52,13 @@ class Task(Generic[P, R]):
             name (str | None, optional): Explicit task name (deduplication ID). Defaults to None.
             timeout (int | None, optional): Dispatch deadline in seconds. Defaults to None.
             headers (dict | None, optional): Custom HTTP headers for the request. Defaults to None.
+            add_url_func_name_suffix (bool, optional): Whether to add the function name as a prefix to the URL. Defaults to False.
         """
         self.queue = queue
         self.url = url
         self.name = name
         self.timeout = timeout
+        self.add_url_func_name_suffix = add_url_func_name_suffix
 
         self._client = client
         self._headers = headers or {}
@@ -147,6 +151,12 @@ class Task(Generic[P, R]):
 
     sync_delay = sync_push
 
+    def _get_url(self) -> str:
+        """Returns the target URL for the task, either from the decorator or the client."""
+        if self.add_url_func_name_suffix:
+            return f"{self.url.rstrip('/')}/{self._func.__name__}"
+        return self.url
+
     async def _remote(self, url: str | None = None) -> Any:
         """
         Simulates the Google Cloud Task execution by making a direct HTTP POST request
@@ -172,7 +182,7 @@ class Task(Generic[P, R]):
                 "Install it with: uv add httpx"
             )
 
-        target_url = url or self.url
+        target_url = url or self._get_url()
         payload = json.dumps(self.data, cls=CloudTaskJSONEncoder).encode("utf-8")
         headers = self.headers
 
@@ -194,10 +204,10 @@ class Task(Generic[P, R]):
                 logger.error(
                     f"Remote task failed with status {e.response.status_code}: {e.response.text}"
                 )
-                raise e
+                raise
             except Exception as e:
-                logger.error(f"Failed to connect to worker: {str(e)}")
-                raise e
+                logger.error(f"Failed to connect to worker: {e!s}")
+                raise
 
     def _remote_sync(self, url: str | None = None) -> Any:
         """
@@ -224,7 +234,7 @@ class Task(Generic[P, R]):
                 "Install it with: uv add httpx"
             )
 
-        target_url = url or self.url
+        target_url = url or self._get_url()
         payload = json.dumps(self.data, cls=CloudTaskJSONEncoder).encode("utf-8")
         headers = self.headers
 
@@ -246,10 +256,10 @@ class Task(Generic[P, R]):
                 logger.error(
                     f"Remote task failed with status {e.response.status_code}: {e.response.text}"
                 )
-                raise e
+                raise
             except Exception as e:
-                logger.error(f"Failed to connect to worker: {str(e)}")
-                raise e
+                logger.error(f"Failed to connect to worker: {e!s}")
+                raise
 
     def _build_task_request_payload(self, schedule_time: datetime | None) -> dict:
         """Constructs the dictionary payload expected by Google Cloud Tasks API."""
@@ -259,7 +269,7 @@ class Task(Generic[P, R]):
 
         http_request = {
             "http_method": tasks_v2.HttpMethod.POST,
-            "url": self.url,
+            "url": self._get_url(),
             "headers": self.headers,
             "body": json_body,
         }
@@ -386,6 +396,7 @@ class CloudTaskClient:
         timezone: str | ZoneInfo | None = None,
         force_to_queue: str | None = None,
         eager: None | Literal["remote", "immediate"] = None,
+        add_url_func_name_suffix: bool = False,
     ):
         """
         Initializes the CloudTaskClient.
@@ -402,6 +413,7 @@ class CloudTaskClient:
             secret_header_name (str, optional): The header name for the secret. Defaults to "X-PYCT-SECRET".
             timezone (str | ZoneInfo | None, optional): Default timezone for scheduling. Defaults to UTC.
             force_to_queue (str | NOne, optional): Usefull for dev and staging env, to for use the same queue
+            add_url_func_name_suffix (bool, optional): Whether to add the function name as a prefix to the URL. Defaults to False.
         """
         self.queue = queue
         self.location = location
@@ -413,6 +425,7 @@ class CloudTaskClient:
         self.secret = secret
         self.secret_header_name = secret_header_name
         self.force_to_queue = force_to_queue
+        self.add_url_func_name_suffix = add_url_func_name_suffix
 
         # Timezone Configuration
         if isinstance(timezone, str):
@@ -444,6 +457,7 @@ class CloudTaskClient:
             url (str | None, optional): Override default target URL.
             timeout (int | None, optional): Override default timeout.
             headers (dict | None, optional): Add specific headers.
+            add_url_func_name_suffix (bool, optional): Whether to add the function name as a prefix to the URL. Defaults to False.
 
         Returns:
             Callable: The decorated function which returns a Task object when called.
@@ -462,6 +476,7 @@ class CloudTaskClient:
                     name=name,
                     headers=headers,
                     client=self,
+                    add_url_func_name_suffix=self.add_url_func_name_suffix,
                 )
 
             return inner

@@ -1,7 +1,8 @@
 import importlib
 import inspect
 import logging
-from typing import Any, Callable, Dict, List
+from collections.abc import Callable
+from typing import Any
 
 try:
     from asgiref.sync import async_to_sync
@@ -22,17 +23,17 @@ class CloudTaskExecutor:
     def __init__(self, client: CloudTaskClient):
         self.client = client
 
-    async def run(self, body: Dict[str, Any], headers: Dict[str, str]) -> Any:
+    async def run(self, body: dict[str, Any], headers: dict[str, str]) -> Any:
         """Async entrypoint (For FastAPI/ASGI)."""
         func, args, kwargs = self._prepare_execution(body, headers)
         return await self._execute_impl(func, args, kwargs)
 
-    def sync_run(self, body: Dict[str, Any], headers: Dict[str, str]) -> Any:
+    def sync_run(self, body: dict[str, Any], headers: dict[str, str]) -> Any:
         """Sync entrypoint (For Django WSGI/Flask)."""
         func, args, kwargs = self._prepare_execution(body, headers)
         return self._sync_execute_impl(func, args, kwargs)
 
-    def _prepare_execution(self, body: Dict[str, Any], headers: Dict[str, str]):
+    def _prepare_execution(self, body: dict[str, Any], headers: dict[str, str]):
         """Shared validation and extraction logic."""
 
         if self.client.secret:
@@ -40,10 +41,10 @@ class CloudTaskExecutor:
 
         try:
             func_path: str = body["path"]
-            func_args: List[Any] = body.get("args", [])
-            func_kwargs: Dict[str, Any] = body.get("kwargs", {})
+            func_args: list[Any] = body.get("args", [])
+            func_kwargs: dict[str, Any] = body.get("kwargs", {})
         except KeyError as e:
-            msg = f"Invalid payload: missing field {str(e)}"
+            msg = f"Invalid payload: missing field {e!s}"
             logger.error(msg)
             raise exceptions.TaskExecutionError(msg)
 
@@ -52,15 +53,14 @@ class CloudTaskExecutor:
         func = self.resolve_function(func_path)
         return func, func_args, func_kwargs
 
-    def _validate_secret(self, headers: Dict[str, str]):
+    def _validate_secret(self, headers: dict[str, str]):
         """Robust secret validation handling generic HTTP headers."""
         expected_header = self.client.secret_header_name.lower()
 
         normalized_headers = {}
         for k, v in headers.items():
             key = k.lower().replace("_", "-")
-            if key.startswith("http-"):
-                key = key[5:]
+            key = key.removeprefix("http-")
             normalized_headers[key] = v
 
         received_secret = normalized_headers.get(expected_header)
@@ -84,7 +84,7 @@ class CloudTaskExecutor:
             return result
 
         except Exception as e:
-            logger.exception(f"Async Task Failed '{func.__name__}': Error: {str(e)}")
+            logger.exception(f"Async Task Failed '{func.__name__}': Error: {e!s}")
             raise exceptions.TaskExecutionError(str(e)) from e
 
     @staticmethod
@@ -107,7 +107,7 @@ class CloudTaskExecutor:
             return task.execute()
 
         except Exception as e:
-            logger.exception(f"Sync Task Failed '{func.__name__}': Error: {str(e)}")
+            logger.exception(f"Sync Task Failed '{func.__name__}': Error: {e!s}")
             raise exceptions.TaskExecutionError(str(e)) from e
 
     @staticmethod
@@ -122,5 +122,5 @@ class CloudTaskExecutor:
             return func
 
         except (ImportError, AttributeError, ValueError) as e:
-            logger.error(f"Task resolution failed: {path} - {str(e)}")
-            raise exceptions.TaskNotFound(f"Could not import task '{path}': {str(e)}")
+            logger.error(f"Task resolution failed: {path} - {e!s}")
+            raise exceptions.TaskNotFound(f"Could not import task '{path}': {e!s}")

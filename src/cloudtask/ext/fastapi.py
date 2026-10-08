@@ -1,7 +1,8 @@
 import inspect
 import logging
+from collections.abc import Callable
 from contextlib import AsyncExitStack
-from typing import Any, Callable
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.dependencies.models import Dependant
@@ -17,6 +18,7 @@ logger = logging.getLogger("cloudtask.fastapi")
 class TaskRequestBody(BaseModel):
     """Schema for the Google Cloud Task payload."""
 
+    func: str | None = None
     path: str
     args: list[Any] = []
     kwargs: dict[str, Any] = {}

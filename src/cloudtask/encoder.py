@@ -27,9 +27,7 @@ class CloudTaskJSONEncoder(json.JSONEncoder):
             if obj.microsecond:
                 r = r[:12]
             return r
-        elif isinstance(obj, decimal.Decimal):
-            return str(obj)
-        elif isinstance(obj, uuid.UUID):
+        elif isinstance(obj, decimal.Decimal) or isinstance(obj, uuid.UUID):
             return str(obj)
         elif isinstance(obj, (set, frozenset)):
             return list(obj)
