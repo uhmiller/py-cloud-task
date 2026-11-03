@@ -1,3 +1,4 @@
+import dataclasses
 import inspect
 import logging
 from collections.abc import Callable, Iterator
@@ -11,6 +12,7 @@ from fastapi.dependencies.utils import get_dependant, solve_dependencies
 from pydantic import BaseModel
 
 from cloudtask import CloudTaskClient, exceptions
+from cloudtask.context import TaskContext, current_task
 from cloudtask.core import task_path_of
 from cloudtask.executor import (
     CONTROL_FLOW_EXCEPTIONS,
@@ -30,42 +32,75 @@ class TaskRequestBody(BaseModel):
     kwargs: dict[str, Any] = {}
 
 
+def task_context() -> TaskContext:
+    """
+    FastAPI dependency with the metadata of the running task (retry count, task name, queue, headers).
+
+        @client.task()
+        async def send_email(user_id: str, ctx: TaskContext = Depends(task_context)):
+            if ctx.is_retry: ...
+    """
+    context = current_task()
+    if context is None:
+        raise RuntimeError("task_context is only available while a task runs.")
+    return context
+
+
+# Dependency analysis per task function, built once (the task signature doesn't change).
+_dependants: dict[Callable, Dependant] = {}
+
+
+def _get_dependant(func: Callable) -> Dependant:
+    dependant = _dependants.get(func)
+    if dependant is None:
+        dependant = _dependants[func] = get_dependant(path="", call=func)
+    return dependant
+
+
 class FastAPICloudTaskExecutor(CloudTaskExecutor):
     def __init__(self, client: CloudTaskClient, request: Request):
         super().__init__(client)
         self.request = request
 
+    def _prepare_execution(self, body: Any):
+        func, args, kwargs = super()._prepare_execution(body)
+        # With the task name in the URL (/tasks/<name>), the URL and the payload must agree, so logs and metrics
+        # keyed by the URL are trustworthy.
+        if self.client.add_url_func_name_suffix:
+            segment = self.request.url.path.rstrip("/").rsplit("/", 1)[-1]
+            if segment != func.__name__:
+                raise self._invalid(
+                    f"URL segment '{segment}' doesn't match task '{task_path_of(func)}'"
+                )
+        return func, args, kwargs
+
     async def _execute_impl(self, func: Callable, args: list, kwargs: dict) -> Any:
-
-        # analyze the function to get dependencies
-        dependant: Dependant = get_dependant(
-            path=self.request.url.path,
-            call=func,
-        )
-
-        if not dependant.dependencies:
+        cached = _get_dependant(func)
+        if not cached.dependencies:
             return await super()._execute_impl(func, args, kwargs)
 
-        signature = inspect.signature(func)
-
         try:
-            bound = signature.bind_partial(*args, **kwargs)
+            bound = inspect.signature(func).bind_partial(*args, **kwargs)
             provided_params = set(bound.arguments.keys())
         except TypeError:
             provided_params = set()
 
-        dependant.query_params = [
-            p for p in dependant.query_params if p.name not in provided_params
-        ]
-        dependant.header_params = [
-            p for p in dependant.header_params if p.name not in provided_params
-        ]
-        dependant.cookie_params = [
-            p for p in dependant.cookie_params if p.name not in provided_params
-        ]
-        dependant.body_params = [
-            p for p in dependant.body_params if p.name not in provided_params
-        ]
+        # Parameters the payload provides are not request parameters (copy: the cached analysis is shared).
+        dependant = dataclasses.replace(
+            cached,
+            query_params=[
+                p for p in cached.query_params if p.name not in provided_params
+            ],
+            header_params=[
+                p for p in cached.header_params if p.name not in provided_params
+            ],
+            cookie_params=[
+                p for p in cached.cookie_params if p.name not in provided_params
+            ],
+            body_params=[
+                p for p in cached.body_params if p.name not in provided_params
+            ],
+        )
 
         # Dependencies are solved on a stack owned by this execution, so `yield` dependencies (a DB session)
         # are closed right after the task, and see the task's own exception (rollback) when it fails.

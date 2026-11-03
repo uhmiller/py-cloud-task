@@ -1,7 +1,7 @@
 [project]
 name = "py-cloud-task"
 
-version = "0.2.1"
+version = "0.3.0"
 description = "A framework agnostic Google Cloud Tasks library for the Push architecture."
 readme = "README.md"
 requires-python = ">=3.14"
@@ -13,7 +13,6 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Framework :: FastAPI",
-    "Framework :: Django",
     "Topic :: System :: Distributed Computing",
 ]
 dependencies = [
@@ -24,8 +23,15 @@ dependencies = [
 fastapi = [
     "fastapi>=0.129.0",
 ]
+# httpx for eager="remote" (local worker simulation). "test" is the former name, kept as an alias.
+remote = [
+    "httpx>=0.28.1",
+]
 test = [
     "httpx>=0.28.1",
+]
+validation = [
+    "pydantic>=2.0",
 ]
 
 [build-system]

@@ -1,94 +1,134 @@
 # Architecture
 
+How `py-cloud-task` works inside. For usage, see the [README](../README.md).
+
 ## Flow
 
 ```
-producer (API request, task, scheduler)                Google Cloud Tasks                 worker (same or other service)
-───────────────────────────────────────                ──────────────────                 ──────────────────────────────
-@client.task                                           queue (rate limits,                POST <url> (+ OIDC token, secret header)
-async def send_email(user_id): ...                     retries with backoff,                     │
-                                                       dedup by task name)                       ▼
-task = send_email("123")   # Task object (nothing sent)                                   CloudTaskRouter (ext.fastapi)
-await task.push(at=...)  ──── create_task(HTTP request) ──►  dispatch at schedule time ──►  CloudTaskExecutor
-                                                       non-2xx → retry                     ├ validate secret
-                                                                                           ├ resolve body["path"] → function
-                                                                                           ├ FastAPI: solve Depends(...)
-                                                                                           └ run → 2xx (done) / 5xx (retry)
+producer (API request, task, scheduler)              Google Cloud Tasks               worker (same or other service)
+───────────────────────────────────────              ──────────────────               ──────────────────────────────
+@client.task  → registered in client.registry        queue (rate limits,              POST <url> (+ secret header,
+async def send_email(user_id): ...                   retries with backoff,             OIDC token, X-CloudTasks-*)
+                                                     dedup by task name)                     │
+task = send_email("123")   # Task (nothing sent)                                             ▼
+await task.push(at=...) ── create_task(HTTP task) ──► dispatch when due ──────────────► CloudTaskRouter (ext.fastapi)
+                                                     non-2xx → retry                   CloudTaskExecutor
+                                                                                       ├ authenticate (secret)
+                                                                                       ├ validate payload
+                                                                                       ├ registry lookup of body["path"]
+                                                                                       ├ (opt.) coerce arguments
+                                                                                       ├ set TaskContext
+                                                                                       ├ FastAPI: solve Depends(...)
+                                                                                       └ run → response = retry decision
 ```
 
-## Pieces
+## Modules
 
-### `CloudTaskClient` (`core.py`)
+| Module | Role | Depends on |
+|---|---|---|
+| `core.py` | `CloudTaskClient` (configuration, `@task`, registry), `Task` (payload, headers, names, push, eager modes) | `google-cloud-tasks`, stdlib |
+| `executor.py` | `CloudTaskExecutor`: authenticate, validate, resolve, run (sync and async) | stdlib (`asgiref` optional) |
+| `auth.py` | `WorkerAuthenticator`: fail closed, constant-time secret check | stdlib |
+| `context.py` | `TaskContext`, `current_task()` (a `ContextVar`) | stdlib |
+| `validation.py` | `ArgumentValidator` for `validate_args` | pydantic (lazy import) |
+| `testing.py` | `PushedTask`, `PushedTasks`, `recorder()` | stdlib |
+| `encoder.py` | JSON encoder (datetime, Decimal, UUID, sets, Pydantic models) | stdlib |
+| `exceptions.py` | `CloudTaskException` hierarchy | — |
+| `ext/fastapi.py` | `CloudTaskRouter`, `FastAPICloudTaskExecutor`, `task_context` dependency | FastAPI (`fastapi` extra) |
 
-Holds the configuration: GCP `project`, `location`, default `queue`, worker `url`, service account email `sae`
-(for the OIDC token Cloud Tasks attaches), optional shared `secret` (sent as `X-PYCT-SECRET`), `timezone` for
-naive datetimes, `force_to_queue` (send everything to one queue, e.g. staging), `eager` mode, and
-`add_url_func_name_suffix` (worker URL becomes `<url>/<function name>`, handy for logs and metrics).
+`core`, `executor`, `auth`, `context` and `testing` must stay framework-agnostic.
 
-`client.task(queue=, name=, url=, timeout=, headers=)` is a decorator. The decorated function, when called,
-does **not** run: it returns a `Task` holding the function and its arguments.
+## Producer side (`core.py`)
 
-The Google clients (`CloudTasksAsyncClient`, `CloudTasksClient`) are created lazily on first push.
+### `CloudTaskClient`
 
-### `Task` (`core.py`)
+Holds the configuration (project, location, queue, worker `url`, `sae`, `secret`, `timezone`, `force_to_queue`,
+`eager`, `add_url_func_name_suffix`, `context_headers`, `validate_args`, `retry_unknown_tasks`, …). The Google
+clients are created lazily on the first real push.
 
-- `push(at=None, *, headers=None, name=None, if_exists="ignore")` (async) / `sync_push(schedule_time=None, ...)`:
-  build the Cloud Tasks request and create it. Returns the task resource name. `AlreadyExists` → logged, returns
-  the existing path (`if_exists="raise"` → `TaskAlreadyExists`).
-- Payload (JSON body): `{"func": <name>, "path": "<module>.<function>", "args": [...], "kwargs": {...}}`,
-  encoded with `CloudTaskJSONEncoder`.
-- HTTP request: `POST url`, headers, OIDC token when `sae` is set. Headers merge case-insensitively:
-  `client.context_headers()` → decorator → `task.headers` → `push(headers=)`, then secret and `Content-Type`.
-  Reserved Cloud Tasks headers raise `ValueError`.
-- `name` → full task path (`projects/…/queues/…/tasks/<name>`, using `force_to_queue` like the parent): Cloud Tasks
-  rejects a second task with the same name (deduplication, for about an hour after the first one is deleted or
-  executed). The decorator `name` is a template (`"order-{order_id}"`) or a callable rendered per call with the
-  bound arguments; names are validated (`[A-Za-z0-9_-]{1,500}`).
-- `timeout` → `dispatch_deadline` (how long Cloud Tasks waits for the worker; 15 s to 30 min for HTTP tasks).
-- `at` → `schedule_time`; naive datetimes get the client timezone.
-- `execute()` runs the function in the current process (used by the worker and by eager mode).
+`client.task(...)` is a decorator. At decoration it validates the static options (timeout bounds, a static name),
+builds the `ArgumentValidator` when `validate_args` applies (attached to the factory as
+`__cloudtask_validator__`) and registers the factory in `client.registry` under `module.qualname`. Calling the
+factory renders the task name (template or callable, bound with `inspect.signature(...).bind_partial`) and returns
+a `Task`.
 
-### Eager modes (development and tests)
+Precedence for every option: client → decorator → task instance → `push()` argument.
 
-| `eager` | `push()` does |
+### `Task`
+
+- **Payload**: `{"func": <name>, "path": "<module>.<qualname>", "args": [...], "kwargs": {...}}`, encoded by
+  `_encode_body()`. An unencodable argument raises `TaskPushError` naming the argument (never its value); a body
+  over `MAX_PAYLOAD_BYTES` (1 MB) raises `TaskPushError`.
+- **Headers** (`_build_headers`): merged case-insensitively, lowest → highest: `client.context_headers()` (a
+  failing provider is logged and skipped) → decorator → `task.headers` → `push(headers=)`. Reserved Cloud Tasks
+  headers raise `ValueError`. The secret header and `Content-Type` are applied last.
+- **Name**: validated on assignment (`[A-Za-z0-9_-]{1,500}`); the task path uses `force_to_queue` like the parent.
+  `AlreadyExists` from Google → logged, returns the existing path (`if_exists="raise"` → `TaskAlreadyExists`).
+- **Timeout** → `dispatch_deadline` (15 s – 30 min). **`at`** → `schedule_time`; naive datetimes get the client
+  timezone with a warning.
+- `execute()` runs the function in-process (used by the worker and by `immediate` mode).
+
+### Eager modes
+
+| `eager` | `push()` |
 |---|---|
-| `None` | Creates the task in Google Cloud Tasks (production). |
-| `"immediate"` | Runs the function in-process, awaiting it (unit tests, simple local dev). |
-| `"remote"` | Fire-and-forget HTTP POST of the payload to the worker URL (simulates Cloud Tasks against a second local process). |
+| `None` | Creates the task in Cloud Tasks |
+| `"immediate"` | Runs the task in-process inside a `TaskContext` (retry 0). `sync_push` runs async tasks with `asyncio.run`, or raises when a loop is running. `TaskAbort` is logged, not raised |
+| `"remote"` | POSTs the payload to the worker URL with httpx in the background (a task referenced in `_background_tasks` until done, or a daemon thread for `sync_push`). No OIDC token: the local worker authenticates with the secret |
+| `"record"` | Validates like production and appends a `PushedTask` to `client.pushed`; emulates `AlreadyExists` for repeated names |
+
+## Worker side
 
 ### `CloudTaskExecutor` (`executor.py`)
 
-Framework-agnostic worker logic: authenticate the request (shared secret, see below), read `path`, `args`,
-`kwargs` from the body, look the task up in the client registry, call it to get the `Task`, then `execute()` it
-(awaiting coroutines; `sync_run` uses `asgiref` for async tasks in sync frameworks).
+`run(body, headers)` / `sync_run(...)`:
+
+1. `client.authenticator.authenticate(headers)`. The authenticator is built on first access and raises
+   `ImproperlyConfigured` without a secret (unless `insecure_allow_unauthenticated`); the executor builds it in
+   `__init__`, so a misconfigured worker fails at startup.
+2. Payload checks → `InvalidTaskPayload`: body is an object, `path` a non-empty string, `args` a list, `kwargs` an
+   object, arguments bind (partially) to the signature.
+3. `client.get_task(path)` → `TaskNotFound`. Nothing is ever imported from request data.
+4. Optional `ArgumentValidator.validate` → `InvalidTaskPayload` (parameter names and messages, no values).
+5. Sets the `TaskContext` (from `X-CloudTasks-*` headers; the secret, `Authorization` and cookies are hidden) for
+   the duration of the run, then calls the factory and executes the `Task`.
+
+`TaskAbort`, `TaskRetry` and `InvalidTaskPayload` propagate unchanged; any other exception becomes
+`TaskExecutionError` (chained).
 
 ### FastAPI extension (`ext/fastapi.py`)
 
-- `CloudTaskRouter(client)` registers `POST ""` (mount it under a prefix such as `/tasks/{name}`). The handler
-  parses the JSON body itself, so authentication runs before payload validation.
-- `FastAPICloudTaskExecutor` resolves FastAPI dependencies declared in the task signature
-  (`db: AsyncSession = Depends(get_db)`), skipping parameters that the payload already provides, and runs the task
-  inside an `AsyncExitStack` owned by the execution, so `yield` dependencies (the DB session) are closed right
-  after the task and receive the task's exception (rollback). Overrides (`app.dependency_overrides`) apply.
-- Response mapping (every non-2xx response makes Cloud Tasks retry): success → 200 `success` (no result);
-  `TaskAbort` → 200 `aborted`; `InvalidTaskPayload` / `TaskNotFound` → 200 `rejected` (404 for unknown tasks with
-  `retry_unknown_tasks=True`); authentication → 403; `TaskRetry` → 503; failure → 500.
-- The executor never wraps `TaskAbort`, `TaskRetry` or `InvalidTaskPayload` into `TaskExecutionError`. Payload
-  checks: body is an object, `path` a non-empty string, `args` a list, `kwargs` an object, and the arguments bind
-  to the task signature (partially: FastAPI dependencies are filled in later).
+- `CloudTaskRouter(client)` registers `POST ""`, touches `client.authenticator` (fail closed at startup) and parses
+  the JSON body itself, so authentication runs before payload validation (FastAPI would answer 422 first).
+- `FastAPICloudTaskExecutor`:
+  - with `add_url_func_name_suffix`, rejects a request whose last URL segment isn't the task's function name;
+  - caches `get_dependant(...)` per function and copies it per run, dropping the parameters the payload provides;
+  - solves dependencies with `app` as `dependency_overrides_provider`, on an `AsyncExitStack` owned by the run
+    (it temporarily replaces `fastapi_inner_astack` / `fastapi_function_astack` in the request scope), so `yield`
+    dependencies close right after the task and receive its exception;
+  - dependency errors (missing task arguments) → `InvalidTaskPayload`.
+- `task_context()` is the dependency returning the current `TaskContext`.
+
+Response mapping (Cloud Tasks retries every non-2xx):
+
+| Outcome | Response |
+|---|---|
+| success | 200 `{"status": "success"}` (the result is never serialized) |
+| `TaskAbort` | 200 `{"status": "aborted", "reason": ...}` |
+| `InvalidTaskPayload`, `TaskNotFound` | 200 `{"status": "rejected", "error": ...}`; `TaskNotFound` → 404 with `retry_unknown_tasks` |
+| `TaskAuthenticationError` | 403 |
+| `TaskRetry` | 503 |
+| `TaskExecutionError` | 500 |
 
 ## Security model
 
-- **Registry.** `@client.task` registers the function in `client.registry` (key: `module.qualname`). The executor
-  resolves `body["path"]` only through the registry (`client.get_task`); it never imports from request data.
-  Task modules must be imported at startup (`client.autodiscover("app.tasks")` helps).
-- **Fail closed.** `CloudTaskExecutor` and `CloudTaskRouter` build `client.authenticator`
-  (`cloudtask.auth.WorkerAuthenticator`), which raises `ImproperlyConfigured` without a `secret`.
-  `insecure_allow_unauthenticated=True` is the local-development escape hatch.
-- **Secret.** `X-PYCT-SECRET` (configurable), compared with `hmac.compare_digest`. Failure →
-  `InvalidTaskSecretError` (a `TaskAuthenticationError`) → 403.
-- **OIDC.** Cloud Tasks attaches an OIDC token for `sae`, but the library does not verify it (decision: shared
-  secret only). It only helps when Cloud Run itself requires authentication.
+- **Registry**: only functions decorated with `@client.task` (and imported) can run.
+- **Fail closed**: no secret → the worker refuses to start.
+- **Secret**: `X-PYCT-SECRET` (configurable), `hmac.compare_digest`, header names case-insensitive (WSGI
+  `HTTP_*` names accepted).
+- **OIDC**: Cloud Tasks attaches a token for `sae`; the library does not verify it (decision: the shared secret is
+  the only library-level authentication). It matters only when Cloud Run itself requires authentication.
+- **Logs**: task paths, names and queues only; never arguments, payloads or header values.
 
 ## Consumers
 
@@ -97,4 +137,6 @@ Framework-agnostic worker logic: authenticate the request (shared secret, see be
 | Ziett API | `ziett/core/tasks.py` (client), `ziett/tasks/*` (tasks), router at `/o/tasks/{name}`, events push tasks |
 | Única Peça API | `unica/core/tasks.py` (client), `unica/tasks/*` (tasks), router at `/o/tasks/{name}`, events push tasks |
 
-Both mount the router in the same service as the API and use FastAPI dependency injection for the DB session.
+Both mount the router in the same service as the API, use `add_url_func_name_suffix=True` and FastAPI dependency
+injection for the DB session. Both import every task module through their `tasks` package, which keeps the
+registry complete.

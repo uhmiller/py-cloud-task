@@ -398,7 +398,7 @@ wheels = [
 
 [[package]]
 name = "py-cloud-task"
-version = "0.2.1"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "google-cloud-tasks" },
@@ -408,8 +408,14 @@ dependencies = [
 fastapi = [
     { name = "fastapi" },
 ]
+remote = [
+    { name = "httpx" },
+]
 test = [
     { name = "httpx" },
+]
+validation = [
+    { name = "pydantic" },
 ]
 
 [package.dev-dependencies]
@@ -423,9 +429,11 @@ dev = [
 requires-dist = [
     { name = "fastapi", marker = "extra == 'fastapi'", specifier = ">=0.129.0" },
     { name = "google-cloud-tasks", specifier = ">=2.21.0" },
+    { name = "httpx", marker = "extra == 'remote'", specifier = ">=0.28.1" },
     { name = "httpx", marker = "extra == 'test'", specifier = ">=0.28.1" },
+    { name = "pydantic", marker = "extra == 'validation'", specifier = ">=2.0" },
 ]
-provides-extras = ["fastapi", "test"]
+provides-extras = ["fastapi", "remote", "test", "validation"]
 
 [package.metadata.requires-dev]
 dev = [

@@ -9,6 +9,8 @@ except ImportError:
     async_to_sync = None
 
 from cloudtask import CloudTaskClient, Task, exceptions
+from cloudtask.auth import normalize_headers
+from cloudtask.context import TaskContext, task_context_scope
 from cloudtask.core import task_path_of
 
 logger = logging.getLogger("cloudtask.executor")
@@ -51,13 +53,22 @@ class CloudTaskExecutor:
         """Async entrypoint (For FastAPI/ASGI)."""
         self.authenticator.authenticate(headers)
         func, args, kwargs = self._prepare_execution(body)
-        return await self._execute_impl(func, args, kwargs)
+        with task_context_scope(self._task_context(func, headers)):
+            return await self._execute_impl(func, args, kwargs)
 
     def sync_run(self, body: Any, headers: Mapping[str, str]) -> Any:
         """Sync entrypoint (For Django WSGI/Flask)."""
         self.authenticator.authenticate(headers)
         func, args, kwargs = self._prepare_execution(body)
-        return self._sync_execute_impl(func, args, kwargs)
+        with task_context_scope(self._task_context(func, headers)):
+            return self._sync_execute_impl(func, args, kwargs)
+
+    def _task_context(self, func: Callable, headers: Mapping[str, str]) -> TaskContext:
+        return TaskContext.from_headers(
+            task_path_of(func),
+            normalize_headers(headers),
+            hidden=frozenset({self.client.secret_header_name.lower()}),
+        )
 
     def _prepare_execution(self, body: Any):
         """
@@ -89,6 +100,14 @@ class CloudTaskExecutor:
             raise self._invalid(
                 f"arguments don't match task '{func_path}': {e}"
             ) from None
+
+        validator = getattr(func, "__cloudtask_validator__", None)
+        if validator is not None:
+            try:
+                func_args, func_kwargs = validator.validate(func_args, func_kwargs)
+            except exceptions.InvalidTaskPayload as e:
+                logger.error("Invalid task payload for %s: %s", func_path, e)
+                raise
         return func, func_args, func_kwargs
 
     @staticmethod

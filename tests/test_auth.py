@@ -1,4 +1,4 @@
-"""Worker authentication: fail closed, constant-time shared secret (docs/improvements.md §1)."""
+"""Worker authentication: fail closed, constant-time shared secret."""
 
 import logging
 from unittest import mock

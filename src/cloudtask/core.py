@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import importlib
 import inspect
 import json
@@ -7,7 +8,7 @@ import re
 import string
 import threading
 from collections.abc import Callable, Coroutine, Mapping
-from datetime import datetime
+from datetime import UTC, datetime
 from functools import wraps
 from logging import getLogger
 from typing import TYPE_CHECKING, Any, Generic, Literal, NoReturn, ParamSpec, TypeVar
@@ -18,7 +19,9 @@ from google.cloud import tasks_v2
 from google.protobuf import duration_pb2, timestamp_pb2
 
 from cloudtask import exceptions
+from cloudtask.context import TaskContext, task_context_scope
 from cloudtask.encoder import CloudTaskJSONEncoder
+from cloudtask.testing import PushedTask, PushedTasks
 
 if TYPE_CHECKING:
     from cloudtask.auth import WorkerAuthenticator
@@ -30,7 +33,17 @@ R = TypeVar("R")
 logger = getLogger("cloudtask")
 
 IfExists = Literal["ignore", "raise"]
+EagerMode = Literal["immediate", "remote", "record"]
 TaskName = str | Callable[..., str]
+
+# Cloud Tasks rejects tasks over 1 MB; checked on the JSON body, conservatively, before calling Google.
+MAX_PAYLOAD_BYTES = 1_000_000
+
+# Dispatch deadline accepted for HTTP tasks, in seconds.
+MIN_TIMEOUT, MAX_TIMEOUT = 15, 30 * 60
+
+# Background deliveries of `remote` mode, referenced until they finish.
+_background_tasks: set[asyncio.Task] = set()
 
 # Cloud Tasks task IDs: letters, digits, hyphens and underscores, at most 500 characters.
 _TASK_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,500}")
@@ -53,6 +66,36 @@ def validate_task_name(name: str) -> None:
             "Invalid task name: use only letters, digits, '-' and '_', 1 to 500 characters "
             f"(got {length})."
         )
+
+
+def validate_timeout(timeout: int) -> None:
+    """
+    Raises:
+        ValueError: The dispatch deadline is outside what Cloud Tasks accepts for HTTP tasks (15 s to 30 min).
+    """
+    if not MIN_TIMEOUT <= timeout <= MAX_TIMEOUT:
+        raise ValueError(
+            f"Task timeout must be between {MIN_TIMEOUT} and {MAX_TIMEOUT} seconds (got {timeout})."
+        )
+
+
+def _loop_is_running() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _import_httpx():
+    try:
+        import httpx
+    except ImportError:
+        raise ImportError(
+            "The 'httpx' library is required for eager='remote'. "
+            "Install it with: uv add 'py-cloud-task[remote]'"
+        ) from None
+    return httpx
 
 
 def _merge_headers(*layers: Mapping[str, str] | None) -> dict[str, str]:
@@ -184,39 +227,34 @@ class Task(Generic[P, R]):
         if_exists: IfExists = "ignore",
     ) -> str | None:
         """
-        Async push to Cloud Tasks. (Non-blocking IO)
-        Recommended for FastAPI and Async Contexts.
+        Push the task to Cloud Tasks (async, non-blocking). Use it in FastAPI and other async code.
 
         Args:
-            at: When the task should run (aware datetime; naive ones get the client timezone).
+            at: When the task should run. Pass an aware datetime; a naive one gets the client timezone and logs a
+                warning.
             headers: Extra headers for this push (highest precedence).
             name: Task name for this push only (deduplication), overriding the decorator/instance name.
             if_exists: What to do when a task with this name already exists: ``"ignore"`` (return its path) or
                 ``"raise"`` (``TaskAlreadyExists``).
 
         Returns:
-            The task resource name, or None in eager modes.
+            The task resource name; the recorded path in ``record`` mode; None in ``immediate`` and ``remote``.
 
         Raises:
-            ValueError: Invalid task name or reserved header.
+            ValueError: Invalid task name, timeout or reserved header.
             TaskAlreadyExists: The name is taken and ``if_exists="raise"``.
-            TaskPushError: Cloud Tasks rejected the task.
+            TaskPushError: An argument isn't JSON-serializable, the payload is too large, or Cloud Tasks rejected
+                the task.
         """
-        # Eager Mode (Local Dev)
-        if self._client.eager:
-            if self._client.eager == "immediate":
-                logger.info("[Eager-Async] Running task %s locally.", self._func_path)
-                try:
-                    if self._is_coroutine:
-                        await self.execute()
-                    else:
-                        self.execute()
-                except exceptions.TaskAbort as e:
-                    logger.warning("Task %s aborted: %s", self._func_path, e.reason)
-                return None
-            elif self._client.eager == "remote":
-                await self._remote(headers=self._build_headers(headers))
-                return None
+        mode = self._client.eager
+        if mode == "immediate":
+            await self._run_immediate(headers)
+            return None
+        if mode == "remote":
+            await self._remote(headers=self._build_headers(headers))
+            return None
+        if mode == "record":
+            return self._record(at, headers, name, if_exists)
 
         task_name = self._resolve_push_name(name)
         payload = self._build_task_request_payload(at, headers=headers, name=task_name)
@@ -232,6 +270,7 @@ class Task(Generic[P, R]):
         return response.name
 
     delay = push
+    """Alias of :meth:`push`."""
 
     def sync_push(
         self,
@@ -242,29 +281,19 @@ class Task(Generic[P, R]):
         if_exists: IfExists = "ignore",
     ) -> str | None:
         """
-        Synchronous blocking push to Cloud Tasks.
-        Use this ONLY in synchronous contexts (e.g., legacy Django views).
+        Push the task to Cloud Tasks, blocking. Use it only in synchronous code (e.g. Django views).
 
-        Same options as :meth:`push` (``schedule_time`` is ``at``).
+        Same options, return value and errors as :meth:`push` (``schedule_time`` is ``at``).
         """
-
-        if self._client.eager:
-            if self._client.eager == "immediate":
-                logger.info("[Eager-Sync] Running task %s locally.", self._func_path)
-                if self._is_coroutine:
-                    logger.warning(
-                        "Task %s is async but called via sync_push in eager mode. "
-                        "You might need to await the result or use task.push() instead.",
-                        self._func_path,
-                    )
-                try:
-                    self.execute()  # type: ignore
-                except exceptions.TaskAbort as e:
-                    logger.warning("Task %s aborted: %s", self._func_path, e.reason)
-                return None
-            elif self._client.eager == "remote":
-                self._remote_sync(headers=self._build_headers(headers))
-                return None
+        mode = self._client.eager
+        if mode == "immediate":
+            self._run_immediate_sync(headers)
+            return None
+        if mode == "remote":
+            self._remote_sync(headers=self._build_headers(headers))
+            return None
+        if mode == "record":
+            return self._record(schedule_time, headers, name, if_exists)
 
         task_name = self._resolve_push_name(name)
         payload = self._build_task_request_payload(
@@ -281,6 +310,84 @@ class Task(Generic[P, R]):
         return response.name
 
     sync_delay = sync_push
+    """Alias of :meth:`sync_push`."""
+
+    # --- eager modes -------------------------------------------------------------------------------------------
+
+    def _eager_context(self, headers: Mapping[str, str] | None) -> TaskContext:
+        """The task context of an in-process run: first attempt, with the headers a push would send."""
+        context = TaskContext.from_headers(
+            self._func_path,
+            self._build_headers(headers),
+            hidden=frozenset({self._client.secret_header_name.lower()}),
+        )
+        return dataclasses.replace(
+            context,
+            queue=self._client.force_to_queue or self.queue,
+            task_name=self.name,
+        )
+
+    async def _run_immediate(self, headers: Mapping[str, str] | None) -> None:
+        logger.info("[Eager] Running task %s in the current process.", self._func_path)
+        with task_context_scope(self._eager_context(headers)):
+            try:
+                result = self.execute()
+                if inspect.isawaitable(result):
+                    await result
+            except exceptions.TaskAbort as e:
+                logger.warning("Task %s aborted: %s", self._func_path, e.reason)
+
+    def _run_immediate_sync(self, headers: Mapping[str, str] | None) -> None:
+        logger.info("[Eager] Running task %s in the current process.", self._func_path)
+        if self._is_coroutine and _loop_is_running():
+            raise RuntimeError(
+                f"Task {self._func_path} is async and an event loop is running: "
+                "use 'await task.push()' instead of 'task.sync_push()'."
+            )
+        with task_context_scope(self._eager_context(headers)):
+            try:
+                result = self.execute()
+                if inspect.iscoroutine(result):
+                    asyncio.run(result)
+            except exceptions.TaskAbort as e:
+                logger.warning("Task %s aborted: %s", self._func_path, e.reason)
+
+    def _record(
+        self,
+        schedule_time: datetime | None,
+        headers: Mapping[str, str] | None,
+        name: str | None,
+        if_exists: IfExists,
+    ) -> str:
+        """``record`` mode: validate the push like production and append it to ``client.pushed``."""
+        task_name = self._resolve_push_name(name)
+        final_headers = self._build_headers(headers)
+        self._encode_body()
+        self._validate_timeout()
+        schedule_time = self._normalize_schedule_time(schedule_time)
+        queue = self._client.force_to_queue or self.queue
+        pushed = self._client.pushed
+
+        if task_name and any(p.queue == queue and p.name == task_name for p in pushed):
+            return self._handle_already_exists(
+                AlreadyExists("recorded"), task_name, if_exists
+            )
+
+        path = self._task_path(task_name or f"recorded-{len(pushed) + 1}")
+        pushed.append(
+            PushedTask(
+                path=self._func_path,
+                args=self._func_args,
+                kwargs=dict(self._func_kwargs),
+                queue=queue,
+                name=task_name,
+                schedule_time=schedule_time,
+                headers=final_headers,
+                task_path=path,
+            )
+        )
+        logger.debug("Task recorded: %s", path)
+        return path
 
     def _get_url(self) -> str:
         """Returns the target URL for the task, either from the decorator or the client."""
@@ -302,16 +409,9 @@ class Task(Generic[P, R]):
         Raises:
             ImportError: If 'httpx' is not installed.
         """
-        try:
-            import httpx
-        except ImportError:
-            raise ImportError(
-                "The 'httpx' library is required for local remote simulation. "
-                "Install it with: uv add httpx"
-            )
-
+        httpx = _import_httpx()
         target_url = url or self._get_url()
-        payload = json.dumps(self.data, cls=CloudTaskJSONEncoder).encode("utf-8")
+        payload = self._encode_body()
         headers = headers if headers is not None else self.headers
 
         logger.info("Remote task dispatched: %s -> %s", self._func_path, target_url)
@@ -332,8 +432,11 @@ class Task(Generic[P, R]):
                     type(e).__name__,
                 )
 
-        # Schedule on the event loop and return immediately
-        asyncio.create_task(_send())
+        # Schedule on the event loop and return immediately. Keep a reference until it finishes: the loop only
+        # keeps weak references, so an unreferenced task may be garbage-collected before it runs.
+        background = asyncio.create_task(_send())
+        _background_tasks.add(background)
+        background.add_done_callback(_background_tasks.discard)
 
     def _remote_sync(
         self, url: str | None = None, headers: dict[str, str] | None = None
@@ -349,16 +452,9 @@ class Task(Generic[P, R]):
         Raises:
             ImportError: If 'httpx' is not installed.
         """
-        try:
-            import httpx
-        except ImportError:
-            raise ImportError(
-                "The 'httpx' library is required for local remote simulation. "
-                "Install it with: uv add httpx"
-            )
-
+        httpx = _import_httpx()
         target_url = url or self._get_url()
-        payload = json.dumps(self.data, cls=CloudTaskJSONEncoder).encode("utf-8")
+        payload = self._encode_body()
         headers = headers if headers is not None else self.headers
 
         logger.info("Remote task dispatched: %s -> %s", self._func_path, target_url)
@@ -382,6 +478,8 @@ class Task(Generic[P, R]):
         # Run in a background thread and return immediately
         thread = threading.Thread(target=_send, daemon=True)
         thread.start()
+
+    # --- request building --------------------------------------------------------------------------------------
 
     def _build_headers(self, extra: Mapping[str, str] | None = None) -> dict[str, str]:
         """
@@ -412,6 +510,66 @@ class Task(Generic[P, R]):
         validate_task_name(name)
         return name
 
+    def _encode_body(self) -> bytes:
+        """
+        Encode the payload as JSON.
+
+        Raises:
+            TaskPushError: An argument can't be encoded (the message names it, never its value), or the payload
+                is over :data:`MAX_PAYLOAD_BYTES`.
+        """
+        try:
+            body = json.dumps(self.data, cls=CloudTaskJSONEncoder).encode("utf-8")
+        except (TypeError, ValueError) as e:
+            argument = self._unencodable_argument()
+            raise exceptions.TaskPushError(
+                f"Task {self._func_path}: argument '{argument}' is not JSON-serializable "
+                f"({type(e).__name__}). Pass ids and primitives."
+            ) from e
+        if len(body) > MAX_PAYLOAD_BYTES:
+            raise exceptions.TaskPushError(
+                f"Task {self._func_path}: payload too large ({len(body)} bytes, limit {MAX_PAYLOAD_BYTES}). "
+                "Pass ids and read the data inside the task."
+            )
+        return body
+
+    def _unencodable_argument(self) -> str:
+        """Name (or position) of the first argument the JSON encoder rejects."""
+        try:
+            bound = inspect.signature(self._func).bind_partial(
+                *self._func_args, **self._func_kwargs
+            )
+            values = list(bound.arguments.items())
+        except TypeError:
+            values = [(f"#{i}", v) for i, v in enumerate(self._func_args)]
+            values += list(self._func_kwargs.items())
+        for argument, value in values:
+            try:
+                json.dumps(value, cls=CloudTaskJSONEncoder)
+            except TypeError, ValueError:
+                return argument
+        return "?"
+
+    def _validate_timeout(self) -> None:
+        if self.timeout:
+            validate_timeout(self.timeout)
+
+    def _normalize_schedule_time(
+        self, schedule_time: datetime | None
+    ) -> datetime | None:
+        if schedule_time is None:
+            return None
+        if schedule_time.tzinfo is None:
+            logger.warning(
+                "Task %s scheduled with a naive datetime; assuming %s. Pass an aware datetime.",
+                self._func_path,
+                self._client.timezone,
+            )
+            schedule_time = schedule_time.replace(tzinfo=self._client.timezone)
+        if schedule_time < datetime.now(UTC):
+            logger.debug("Task %s scheduled in the past; it runs now.", self._func_path)
+        return schedule_time
+
     def _build_task_request_payload(
         self,
         schedule_time: datetime | None,
@@ -419,18 +577,14 @@ class Task(Generic[P, R]):
         name: str | None = None,
     ) -> dict:
         """Constructs the dictionary payload expected by Google Cloud Tasks API."""
-
-        # Encoding payload to JSON bytes
-        json_body = json.dumps(self.data, cls=CloudTaskJSONEncoder).encode("utf-8")
-
         http_request = {
             "http_method": tasks_v2.HttpMethod.POST,
             "url": self._get_url(),
             "headers": self._build_headers(headers),
-            "body": json_body,
+            "body": self._encode_body(),
         }
 
-        # OIDC Authentication configuration
+        # OIDC token for Cloud Run IAM (the library itself authenticates with the secret header)
         if self._client.sae:
             http_request["oidc_token"] = {"service_account_email": self._client.sae}
 
@@ -444,20 +598,14 @@ class Task(Generic[P, R]):
 
         # Dispatch Deadline (Timeout)
         if self.timeout:
+            self._validate_timeout()
             duration = duration_pb2.Duration()
             duration.FromSeconds(self.timeout)
             task["dispatch_deadline"] = duration
 
         # Scheduling
+        schedule_time = self._normalize_schedule_time(schedule_time)
         if schedule_time:
-            # If datetime is naive (no timezone), apply the client's default timezone
-            if schedule_time.tzinfo is None:
-                logger.debug(
-                    "Received naive datetime for schedule. Applying client timezone: %s",
-                    self._client.timezone,
-                )
-                schedule_time = schedule_time.replace(tzinfo=self._client.timezone)
-
             timestamp = timestamp_pb2.Timestamp()
             timestamp.FromDatetime(schedule_time)
             task["schedule_time"] = timestamp
@@ -573,11 +721,12 @@ class CloudTaskClient:
         secret_header_name: str = "X-PYCT-SECRET",
         timezone: str | ZoneInfo | None = None,
         force_to_queue: str | None = None,
-        eager: None | Literal["remote", "immediate"] = None,
+        eager: EagerMode | None = None,
         add_url_func_name_suffix: bool = False,
         insecure_allow_unauthenticated: bool = False,
         context_headers: Callable[[], Mapping[str, str]] | None = None,
         retry_unknown_tasks: bool = False,
+        validate_args: bool = False,
     ):
         """
         Initializes the CloudTaskClient.
@@ -588,8 +737,11 @@ class CloudTaskClient:
             location (str): GCP Region (e.g., 'europe-west1').
             url (str): Default target URL (worker endpoint).
             sae (str): Service Account Email for OIDC authentication.
-            eager (bool, optional): If True, runs tasks locally instead of pushing to GCP. Defaults to False.
-            timeout (int | None, optional): Default timeout for tasks in seconds. Defaults to None.
+            eager (str | None, optional): Development and test modes instead of pushing to GCP:
+                ``"immediate"`` runs the task in-process, ``"remote"`` POSTs it to the worker URL in the background,
+                ``"record"`` appends it to ``client.pushed``. Defaults to None (production).
+            timeout (int | None, optional): Default dispatch deadline for tasks in seconds (15 to 1800).
+                Defaults to None (Cloud Tasks default, 10 minutes).
             secret (str, optional): A shared secret/token to send in headers for security. Defaults to "".
             secret_header_name (str, optional): The header name for the secret. Defaults to "X-PYCT-SECRET".
             timezone (str | ZoneInfo | None, optional): Default timezone for scheduling. Defaults to UTC.
@@ -602,6 +754,9 @@ class CloudTaskClient:
                 without them. Defaults to None.
             retry_unknown_tasks (bool, optional): Worker side: answer 404 (Cloud Tasks retries) instead of
                 200 "rejected" for tasks that aren't registered, e.g. during blue/green deploys. Defaults to False.
+            validate_args (bool, optional): Worker side: validate and convert task arguments to their annotated
+                types with pydantic (``datetime``, ``Decimal``, enums, models). Overridable per task.
+                Defaults to False.
         """
         self.queue = queue
         self.location = location
@@ -617,6 +772,16 @@ class CloudTaskClient:
         self.insecure_allow_unauthenticated = insecure_allow_unauthenticated
         self.context_headers = context_headers
         self.retry_unknown_tasks = retry_unknown_tasks
+        self.validate_args = validate_args
+        if timeout:
+            validate_timeout(timeout)
+        if validate_args:
+            from cloudtask.validation import ensure_pydantic
+
+            ensure_pydantic()
+
+        # Pushes recorded in eager="record" mode (see cloudtask.testing).
+        self.pushed = PushedTasks()
 
         # Tasks the worker is allowed to run, keyed by their dotted path.
         self.registry: dict[str, Callable[..., Task]] = {}
@@ -642,6 +807,7 @@ class CloudTaskClient:
         url: str | None = None,
         timeout: int | None = None,
         headers: dict[str, str] | None = None,
+        validate_args: bool | None = None,
     ) -> Callable[[Callable[P, R]], Callable[P, Task[P, R]]]:
         """
         Decorator to convert a function into a Cloud Task.
@@ -652,8 +818,9 @@ class CloudTaskClient:
                 formatted with the call's arguments (``"expire-order-{order_id}"``) or a callable receiving them
                 as keyword arguments. A static name is shared by every call (only the first push succeeds).
             url (str | None, optional): Override default target URL.
-            timeout (int | None, optional): Override default timeout.
+            timeout (int | None, optional): Override default timeout (15 to 1800 seconds).
             headers (dict | None, optional): Add specific headers.
+            validate_args (bool | None, optional): Override the client's ``validate_args`` for this task.
 
         Returns:
             Callable: The decorated function which returns a Task object when called.
@@ -662,6 +829,15 @@ class CloudTaskClient:
         def decorator(func: Callable[P, R]) -> Callable[P, Task[P, R]]:
             path = task_path_of(func)
             signature = inspect.signature(func)
+            if timeout:
+                validate_timeout(timeout)
+            validate = self.validate_args if validate_args is None else validate_args
+            validator = None
+            if validate:
+                from cloudtask.validation import ArgumentValidator, ensure_pydantic
+
+                ensure_pydantic()
+                validator = ArgumentValidator(func)
             static_name = isinstance(name, str) and not _template_fields(name)
             if static_name:
                 validate_task_name(name)
@@ -691,6 +867,7 @@ class CloudTaskClient:
                     add_url_func_name_suffix=self.add_url_func_name_suffix,
                 )
 
+            inner.__cloudtask_validator__ = validator  # type: ignore[attr-defined]
             self._register(path, inner)
             return inner
 

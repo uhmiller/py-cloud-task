@@ -1,8 +1,9 @@
-"""Push options: context headers (§2), duplicate names (§3) and per-call names (§4)."""
+"""Push options: context headers, duplicate names, per-call names and push-side validation."""
 
 import asyncio
 import logging
 import threading
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest import mock
 
@@ -31,7 +32,7 @@ def sent_headers(create_task: mock.Mock) -> dict:
     return sent_task(create_task)["http_request"]["headers"]
 
 
-# --- §2 context headers ----------------------------------------------------------------------------------------
+# --- context headers -------------------------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -190,7 +191,7 @@ async def test_remote_mode_sends_context_headers(make_client, monkeypatch):
     assert received[1].headers["x-request-id"] == "r1"
 
 
-# --- §3 duplicate task names -----------------------------------------------------------------------------------
+# --- duplicate task names --------------------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -239,7 +240,7 @@ async def test_other_google_errors_raise_push_error_with_cause(client):
     assert isinstance(info.value.__cause__, PermissionDenied)
 
 
-# --- §4 task names per call ------------------------------------------------------------------------------------
+# --- task names per call ---------------------------------------------------------------------------------------
 
 
 async def test_name_template_uses_call_arguments(client):
@@ -354,3 +355,68 @@ async def test_immediate_mode_swallows_abort(make_client, caplog):
     caplog.set_level(logging.WARNING, logger="cloudtask")
     assert await aborts().push() is None
     assert "nothing to do" in caplog.text
+
+
+# --- push-side validation -------------------------------------------------------------------------------------
+
+
+async def test_unencodable_argument_is_named(client):
+    mock_google(client)
+
+    @client.task()
+    async def send(user_id, payload):
+        pass
+
+    with pytest.raises(exceptions.TaskPushError, match="argument 'payload'") as info:
+        await send("u1", payload=object()).push()
+    assert isinstance(info.value.__cause__, TypeError)
+    client._async_client.create_task.assert_not_called()
+
+
+async def test_payload_too_large(client):
+    mock_google(client)
+
+    @client.task()
+    async def send(blob):
+        pass
+
+    with pytest.raises(exceptions.TaskPushError, match="payload too large"):
+        await send("x" * 1_000_001).push()
+    client._async_client.create_task.assert_not_called()
+
+
+@pytest.mark.parametrize("timeout", [1, 14, 1801])
+def test_timeout_out_of_bounds(make_client, timeout):
+    with pytest.raises(ValueError, match="between 15 and 1800"):
+        make_client(timeout=timeout)
+
+    client = make_client()
+    with pytest.raises(ValueError, match="between 15 and 1800"):
+
+        @client.task(timeout=timeout)
+        def send():
+            pass
+
+    @client.task()
+    def other():
+        pass
+
+    task = other()
+    task.timeout = timeout
+    mock_google(client)
+    with pytest.raises(ValueError, match="between 15 and 1800"):
+        task.sync_push()
+
+
+async def test_naive_datetime_warns_and_uses_client_timezone(make_client, caplog):
+    client = mock_google(make_client(timezone="Africa/Luanda"))
+
+    @client.task()
+    async def send():
+        pass
+
+    caplog.set_level(logging.WARNING, logger="cloudtask")
+    await send().push(at=datetime(2030, 1, 1, 9, 0))
+    assert "naive datetime" in caplog.text
+    stamp = sent_task(client._async_client.create_task)["schedule_time"]
+    assert stamp.seconds == int(datetime(2030, 1, 1, 8, 0, tzinfo=UTC).timestamp())

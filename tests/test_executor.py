@@ -1,4 +1,4 @@
-"""Worker-side resolution: only registered tasks run (docs/improvements.md §1)."""
+"""Worker-side resolution: only registered tasks run; payload checks."""
 
 import logging
 import os

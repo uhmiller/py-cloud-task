@@ -1,4 +1,4 @@
-"""FastAPI router: status codes, auth at startup, dependency injection (docs/improvements.md §1, §14)."""
+"""FastAPI router: responses, auth at startup, dependency injection."""
 
 from typing import Annotated
 
@@ -186,7 +186,7 @@ async def test_task_failure_is_500(client, http):
     assert response.status_code == 500
 
 
-# --- dependency injection (§14) --------------------------------------------------------------------------------
+# --- dependency injection --------------------------------------------------------------------------------------
 
 
 class Session:
@@ -291,3 +291,58 @@ async def test_dependency_teardown_failure_is_500(client, http):
         "/tasks", json={"path": task_path_of(works)}, headers=HEADERS
     )
     assert response.status_code == 500
+
+
+# --- URL suffix check and dependency cache ---------------------------------------------------------------------
+
+
+async def test_url_suffix_must_match_the_task(make_client):
+    client = make_client(add_url_func_name_suffix=True)
+
+    @client.task()
+    async def expire_order():
+        pass
+
+    app = FastAPI()
+    app.include_router(CloudTaskRouter(client), prefix="/tasks/{name}")
+    api = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    )
+    body = {"path": task_path_of(expire_order)}
+
+    ok = await api.post("/tasks/expire_order", json=body, headers=HEADERS)
+    assert ok.json() == {"status": "success"}
+    wrong = await api.post("/tasks/send_email", json=body, headers=HEADERS)
+    assert wrong.status_code == 200
+    assert wrong.json()["status"] == "rejected"
+
+
+async def test_dependency_analysis_is_cached(client, http, monkeypatch):
+    from cloudtask.ext import fastapi as ext
+
+    _, api = http
+    calls = []
+    real = ext.get_dependant
+    monkeypatch.setattr(
+        ext, "get_dependant", lambda **kw: calls.append(1) or real(**kw)
+    )
+
+    def get_db():
+        return Session("db", [])
+
+    @client.task()
+    async def work(order_id: str, db: Session = Depends(get_db)):
+        pass
+
+    for order_id in ("a", "b"):
+        response = await api.post(
+            "/tasks",
+            json={"path": task_path_of(work), "kwargs": {"order_id": order_id}},
+            headers=HEADERS,
+        )
+        assert response.json() == {"status": "success"}
+    response = await api.post(
+        "/tasks", json={"path": task_path_of(work), "args": ["c"]}, headers=HEADERS
+    )
+    assert response.json() == {"status": "success"}
+    assert calls == [1]

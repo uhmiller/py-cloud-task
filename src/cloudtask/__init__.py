@@ -1,3 +1,4 @@
+from cloudtask.context import TaskContext, current_task
 from cloudtask.core import CloudTaskClient, Task
 from cloudtask.exceptions import (
     CloudTaskException,
@@ -23,8 +24,10 @@ __all__ = [
     "TaskAbort",
     "TaskAlreadyExists",
     "TaskAuthenticationError",
+    "TaskContext",
     "TaskExecutionError",
     "TaskNotFound",
     "TaskPushError",
     "TaskRetry",
+    "current_task",
 ]
