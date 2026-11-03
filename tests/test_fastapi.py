@@ -6,7 +6,7 @@ import httpx
 import pytest
 from fastapi import Depends, FastAPI, Request
 
-from cloudtask import exceptions
+from cloudtask import TaskAbort, TaskRetry, exceptions
 from cloudtask.core import task_path_of
 from cloudtask.ext.fastapi import CloudTaskRouter
 from tests.conftest import SECRET
@@ -52,12 +52,125 @@ async def test_wrong_secret_is_403(client, http):
     assert response.status_code == 403
 
 
-async def test_unregistered_path_is_404(client, http):
+async def test_unregistered_path_is_rejected_without_retry(client, http):
     _, api = http
     response = await api.post(
         "/tasks", json={"path": "os.system", "args": ["id"]}, headers=HEADERS
     )
+    assert response.status_code == 200
+    assert response.json()["status"] == "rejected"
+
+
+async def test_unregistered_path_is_404_with_retry_unknown_tasks(make_client):
+    client = make_client(retry_unknown_tasks=True)
+    api = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=make_app(client)), base_url="http://test"
+    )
+    response = await api.post("/tasks", json={"path": "gone.task"}, headers=HEADERS)
     assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "content", [b"not json", b"[1, 2]", b'{"args": []}', b'{"path": "x", "args": 1}']
+)
+async def test_invalid_payload_is_rejected_without_retry(client, http, content):
+    _, api = http
+    response = await api.post(
+        "/tasks",
+        content=content,
+        headers={**HEADERS, "Content-Type": "application/json"},
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "rejected"
+
+
+async def test_invalid_payload_without_secret_is_403(client, http):
+    _, api = http
+    response = await api.post("/tasks", content=b"not json")
+    assert response.status_code == 403
+
+
+async def test_abort_is_200_without_retry(client, http):
+    _, api = http
+
+    @client.task()
+    async def already_paid(order_id):
+        raise TaskAbort("order already paid")
+
+    response = await api.post(
+        "/tasks",
+        json={"path": task_path_of(already_paid), "args": ["o1"]},
+        headers=HEADERS,
+    )
+    assert response.status_code == 200
+    assert response.json() == {"status": "aborted", "reason": "order already paid"}
+
+
+async def test_retry_is_503(client, http):
+    _, api = http
+
+    @client.task()
+    async def not_yet():
+        raise TaskRetry()
+
+    response = await api.post(
+        "/tasks", json={"path": task_path_of(not_yet)}, headers=HEADERS
+    )
+    assert response.status_code == 503
+
+
+async def test_result_is_not_returned(client, http):
+    _, api = http
+
+    @client.task()
+    async def returns_unserializable():
+        return object()
+
+    response = await api.post(
+        "/tasks", json={"path": task_path_of(returns_unserializable)}, headers=HEADERS
+    )
+    assert response.status_code == 200
+    assert response.json() == {"status": "success"}
+
+
+async def test_missing_task_argument_with_dependencies_is_rejected(client, http):
+    _, api = http
+
+    def get_db():
+        return Session("db", [])
+
+    @client.task()
+    async def needs_order(order_id: str, db: Session = Depends(get_db)):
+        pass
+
+    response = await api.post(
+        "/tasks", json={"path": task_path_of(needs_order)}, headers=HEADERS
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "rejected"
+
+
+async def test_abort_with_yield_dependency_rolls_back(client, http):
+    _, api = http
+    events: list = []
+
+    async def get_db():
+        try:
+            yield Session("db", events)
+            events.append("commit")
+        except Exception as e:
+            events.append(f"rollback:{type(e).__name__}")
+            raise
+
+    @client.task()
+    async def aborts(db: Session = Depends(get_db)):
+        raise TaskAbort("stop")
+
+    response = await api.post(
+        "/tasks", json={"path": task_path_of(aborts)}, headers=HEADERS
+    )
+    assert response.status_code == 200
+    assert events == ["rollback:TaskAbort"]
 
 
 async def test_task_failure_is_500(client, http):

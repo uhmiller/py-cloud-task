@@ -32,13 +32,18 @@ The Google clients (`CloudTasksAsyncClient`, `CloudTasksClient`) are created laz
 
 ### `Task` (`core.py`)
 
-- `push(at=None)` (async) / `sync_push(schedule_time=None)`: build the Cloud Tasks request and create it.
-  Returns the task resource name.
+- `push(at=None, *, headers=None, name=None, if_exists="ignore")` (async) / `sync_push(schedule_time=None, ...)`:
+  build the Cloud Tasks request and create it. Returns the task resource name. `AlreadyExists` → logged, returns
+  the existing path (`if_exists="raise"` → `TaskAlreadyExists`).
 - Payload (JSON body): `{"func": <name>, "path": "<module>.<function>", "args": [...], "kwargs": {...}}`,
   encoded with `CloudTaskJSONEncoder`.
-- HTTP request: `POST url`, headers (custom + secret + `Content-Type`), OIDC token when `sae` is set.
-- `name` → full task path (`projects/…/queues/…/tasks/<name>`): Cloud Tasks rejects a second task with the same
-  name (deduplication, for about an hour after the first one is deleted or executed).
+- HTTP request: `POST url`, headers, OIDC token when `sae` is set. Headers merge case-insensitively:
+  `client.context_headers()` → decorator → `task.headers` → `push(headers=)`, then secret and `Content-Type`.
+  Reserved Cloud Tasks headers raise `ValueError`.
+- `name` → full task path (`projects/…/queues/…/tasks/<name>`, using `force_to_queue` like the parent): Cloud Tasks
+  rejects a second task with the same name (deduplication, for about an hour after the first one is deleted or
+  executed). The decorator `name` is a template (`"order-{order_id}"`) or a callable rendered per call with the
+  bound arguments; names are validated (`[A-Za-z0-9_-]{1,500}`).
 - `timeout` → `dispatch_deadline` (how long Cloud Tasks waits for the worker; 15 s to 30 min for HTTP tasks).
 - `at` → `schedule_time`; naive datetimes get the client timezone.
 - `execute()` runs the function in the current process (used by the worker and by eager mode).
@@ -59,13 +64,18 @@ Framework-agnostic worker logic: authenticate the request (shared secret, see be
 
 ### FastAPI extension (`ext/fastapi.py`)
 
-- `CloudTaskRouter(client)` registers `POST ""` (mount it under a prefix such as `/tasks/{name}`).
+- `CloudTaskRouter(client)` registers `POST ""` (mount it under a prefix such as `/tasks/{name}`). The handler
+  parses the JSON body itself, so authentication runs before payload validation.
 - `FastAPICloudTaskExecutor` resolves FastAPI dependencies declared in the task signature
   (`db: AsyncSession = Depends(get_db)`), skipping parameters that the payload already provides, and runs the task
   inside an `AsyncExitStack` owned by the execution, so `yield` dependencies (the DB session) are closed right
   after the task and receive the task's exception (rollback). Overrides (`app.dependency_overrides`) apply.
-- Error mapping: authentication failure → 403, unknown task → 404, task failure → 500. Every non-2xx response makes
-  Cloud Tasks retry.
+- Response mapping (every non-2xx response makes Cloud Tasks retry): success → 200 `success` (no result);
+  `TaskAbort` → 200 `aborted`; `InvalidTaskPayload` / `TaskNotFound` → 200 `rejected` (404 for unknown tasks with
+  `retry_unknown_tasks=True`); authentication → 403; `TaskRetry` → 503; failure → 500.
+- The executor never wraps `TaskAbort`, `TaskRetry` or `InvalidTaskPayload` into `TaskExecutionError`. Payload
+  checks: body is an object, `path` a non-empty string, `args` a list, `kwargs` an object, and the arguments bind
+  to the task signature (partially: FastAPI dependencies are filled in later).
 
 ## Security model
 

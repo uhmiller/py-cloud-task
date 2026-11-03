@@ -7,11 +7,11 @@ proposal, and the tests that prove it. Line numbers refer to 0.2.1.
 | # | Item | Priority | Breaking? |
 |---|---|---|---|
 | 1 | Worker runs any importable function; fails open without a secret ✅ done (0.3.0, unreleased) | **Critical** | Yes (only for misconfigured setups) |
-| 2 | Context headers: propagate request id / trace to the task | High | No |
-| 3 | Duplicate task name is an error instead of "already scheduled" | High | Minor |
-| 4 | Per-call task names (template) instead of a static decorator `name` | High | No |
-| 5 | No way to stop retries (permanent failures) | High | No |
-| 6 | Task result is serialized into the response (can turn success into a retry) | High | Minor |
+| 2 | Context headers: propagate request id / trace to the task ✅ done (0.3.0, unreleased) | High | No |
+| 3 | Duplicate task name is an error instead of "already scheduled" ✅ done (0.3.0, unreleased) | High | Minor |
+| 4 | Per-call task names (template) instead of a static decorator `name` ✅ done (0.3.0, unreleased) | High | No |
+| 5 | No way to stop retries (permanent failures) ✅ done (0.3.0, unreleased) | High | No |
+| 6 | Task result is serialized into the response (can turn success into a retry) ✅ done (0.3.0, unreleased) | High | Minor |
 | 7 | Task arguments are not validated or coerced | Medium | No (opt-in) |
 | 8 | Task metadata (retry count, task name) not available to the task | Medium | No |
 | 9 | Testing support: record pushes instead of running them | Medium | No |

@@ -3,14 +3,17 @@ import importlib
 import inspect
 import json
 import pkgutil
+import re
+import string
 import threading
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Mapping
 from datetime import datetime
 from functools import wraps
 from logging import getLogger
-from typing import TYPE_CHECKING, Any, Generic, Literal, ParamSpec, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Literal, NoReturn, ParamSpec, TypeVar
 from zoneinfo import ZoneInfo
 
+from google.api_core.exceptions import AlreadyExists
 from google.cloud import tasks_v2
 from google.protobuf import duration_pb2, timestamp_pb2
 
@@ -25,6 +28,82 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 logger = getLogger("cloudtask")
+
+IfExists = Literal["ignore", "raise"]
+TaskName = str | Callable[..., str]
+
+# Cloud Tasks task IDs: letters, digits, hyphens and underscores, at most 500 characters.
+_TASK_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,500}")
+
+# Headers Cloud Tasks sets or overrides itself (https://cloud.google.com/tasks/docs/reference/rest/v2/HttpRequest).
+_RESERVED_HEADERS = frozenset({"host", "content-length", "user-agent"})
+_RESERVED_HEADER_PREFIXES = ("x-google-", "x-appengine-", "x-cloudtasks-")
+
+
+def validate_task_name(name: str) -> None:
+    """
+    Check a task name against Cloud Tasks rules (``[A-Za-z0-9_-]{1,500}``).
+
+    Raises:
+        ValueError: The name is empty, too long or has other characters (dots, colons, spaces...).
+    """
+    if not isinstance(name, str) or not _TASK_NAME_RE.fullmatch(name):
+        length = len(name) if isinstance(name, str) else type(name).__name__
+        raise ValueError(
+            "Invalid task name: use only letters, digits, '-' and '_', 1 to 500 characters "
+            f"(got {length})."
+        )
+
+
+def _merge_headers(*layers: Mapping[str, str] | None) -> dict[str, str]:
+    """Merge header layers case-insensitively; later layers win. ``_`` in names becomes ``-``."""
+    merged: dict[str, tuple[str, str]] = {}
+    for layer in layers:
+        for name, value in (layer or {}).items():
+            name = name.replace("_", "-")
+            merged[name.lower()] = (name, str(value))
+    return dict(merged.values())
+
+
+def _check_reserved_headers(headers: Mapping[str, str], oidc: bool) -> None:
+    for name in headers:
+        lowered = name.lower()
+        if (
+            lowered in _RESERVED_HEADERS
+            or lowered.startswith(_RESERVED_HEADER_PREFIXES)
+            or (oidc and lowered == "authorization")
+        ):
+            raise ValueError(
+                f"Header '{name}' is reserved by Cloud Tasks and can't be set."
+            )
+
+
+def _template_fields(template: str) -> set[str]:
+    return {
+        field
+        for _, field, _, _ in string.Formatter().parse(template)
+        if field is not None
+    }
+
+
+def _render_task_name(
+    spec: TaskName, signature: inspect.Signature, args: tuple, kwargs: dict
+) -> str:
+    """Render a decorator name (template or callable) with the call's arguments, then validate it."""
+    bound = signature.bind_partial(*args, **kwargs)
+    bound.apply_defaults()
+    arguments = dict(bound.arguments)
+    if callable(spec):
+        rendered = spec(**arguments)
+    else:
+        try:
+            rendered = spec.format(**arguments)
+        except (KeyError, IndexError) as e:
+            raise ValueError(
+                f"Task name template {spec!r} references an unknown argument: {e}"
+            ) from None
+    validate_task_name(rendered)
+    return rendered
 
 
 class Task(Generic[P, R]):
@@ -43,7 +122,7 @@ class Task(Generic[P, R]):
         url: str,
         name: str | None = None,
         timeout: int | None = None,
-        headers: dict[str, str] | None = None,
+        headers: Mapping[str, str] | None = None,
         add_url_func_name_suffix: bool = False,
     ):
         """
@@ -58,8 +137,8 @@ class Task(Generic[P, R]):
             url (str): The target URL (worker endpoint) that will process the task.
             name (str | None, optional): Explicit task name (deduplication ID). Defaults to None.
             timeout (int | None, optional): Dispatch deadline in seconds. Defaults to None.
-            headers (dict | None, optional): Custom HTTP headers for the request. Defaults to None.
-            add_url_func_name_suffix (bool, optional): Whether to add the function name as a prefix to the URL. Defaults to False.
+            headers (Mapping | None, optional): Headers from the decorator. Defaults to None.
+            add_url_func_name_suffix (bool, optional): Whether to add the function name as a suffix to the URL. Defaults to False.
         """
         self.queue = queue
         self.url = url
@@ -68,7 +147,8 @@ class Task(Generic[P, R]):
         self.add_url_func_name_suffix = add_url_func_name_suffix
 
         self._client = client
-        self._headers = headers or {}
+        self._decorator_headers = dict(headers or {})
+        self._instance_headers: dict[str, str] = {}
 
         self._func = func
         self._func_path = task_path_of(func)
@@ -92,69 +172,113 @@ class Task(Generic[P, R]):
         Returns:
             R: The return value of the original function.
         """
-        logger.debug(
-            f"Executing task '{self._func.__name__}' immediately (local/worker)."
-        )
+        logger.debug("Executing task %s in the current process.", self._func_path)
         return self._func(*self._func_args, **self._func_kwargs)
 
-    async def push(self, at: datetime | None = None) -> str | None:
+    async def push(
+        self,
+        at: datetime | None = None,
+        *,
+        headers: Mapping[str, str] | None = None,
+        name: str | None = None,
+        if_exists: IfExists = "ignore",
+    ) -> str | None:
         """
         Async push to Cloud Tasks. (Non-blocking IO)
         Recommended for FastAPI and Async Contexts.
+
+        Args:
+            at: When the task should run (aware datetime; naive ones get the client timezone).
+            headers: Extra headers for this push (highest precedence).
+            name: Task name for this push only (deduplication), overriding the decorator/instance name.
+            if_exists: What to do when a task with this name already exists: ``"ignore"`` (return its path) or
+                ``"raise"`` (``TaskAlreadyExists``).
+
+        Returns:
+            The task resource name, or None in eager modes.
+
+        Raises:
+            ValueError: Invalid task name or reserved header.
+            TaskAlreadyExists: The name is taken and ``if_exists="raise"``.
+            TaskPushError: Cloud Tasks rejected the task.
         """
         # Eager Mode (Local Dev)
         if self._client.eager:
             if self._client.eager == "immediate":
-                logger.info(f"[Eager-Async] Running '{self._func.__name__}' locally.")
-                if self._is_coroutine:
-                    await self.execute()
-                else:
-                    self.execute()
+                logger.info("[Eager-Async] Running task %s locally.", self._func_path)
+                try:
+                    if self._is_coroutine:
+                        await self.execute()
+                    else:
+                        self.execute()
+                except exceptions.TaskAbort as e:
+                    logger.warning("Task %s aborted: %s", self._func_path, e.reason)
                 return None
             elif self._client.eager == "remote":
-                await self._remote()
+                await self._remote(headers=self._build_headers(headers))
                 return None
 
-        payload = self._build_task_request_payload(schedule_time=at)
+        task_name = self._resolve_push_name(name)
+        payload = self._build_task_request_payload(at, headers=headers, name=task_name)
 
         # Send via Async Client (gRPC aio)
         try:
             response = await self._client.service.create_task(request=payload)
-            logger.info(f"Task created (Async): {response.name}")
-            return response.name
+        except AlreadyExists as e:
+            return self._handle_already_exists(e, task_name, if_exists)
         except Exception as e:
             self._handle_error(e)
+        logger.info("Task created: %s", response.name)
+        return response.name
 
     delay = push
 
-    def sync_push(self, schedule_time: datetime | None = None) -> str | None:
+    def sync_push(
+        self,
+        schedule_time: datetime | None = None,
+        *,
+        headers: Mapping[str, str] | None = None,
+        name: str | None = None,
+        if_exists: IfExists = "ignore",
+    ) -> str | None:
         """
         Synchronous blocking push to Cloud Tasks.
         Use this ONLY in synchronous contexts (e.g., legacy Django views).
+
+        Same options as :meth:`push` (``schedule_time`` is ``at``).
         """
 
         if self._client.eager:
             if self._client.eager == "immediate":
-                logger.info(f"[Eager-Sync] Running '{self._func.__name__}' locally.")
+                logger.info("[Eager-Sync] Running task %s locally.", self._func_path)
                 if self._is_coroutine:
                     logger.warning(
-                        f"Task '{self._func.__name__}' is async but called via push_sync in eager mode. "
-                        "You might need to await the result or use task.push() instead."
+                        "Task %s is async but called via sync_push in eager mode. "
+                        "You might need to await the result or use task.push() instead.",
+                        self._func_path,
                     )
-                self.execute()  # type: ignore
+                try:
+                    self.execute()  # type: ignore
+                except exceptions.TaskAbort as e:
+                    logger.warning("Task %s aborted: %s", self._func_path, e.reason)
                 return None
             elif self._client.eager == "remote":
-                self._remote_sync()
+                self._remote_sync(headers=self._build_headers(headers))
                 return None
 
-        payload = self._build_task_request_payload(schedule_time)
+        task_name = self._resolve_push_name(name)
+        payload = self._build_task_request_payload(
+            schedule_time, headers=headers, name=task_name
+        )
 
         try:
             response = self._client.sync_service.create_task(request=payload)
-            logger.info(f"Task created (Sync): {response.name}")
-            return response.name
+        except AlreadyExists as e:
+            return self._handle_already_exists(e, task_name, if_exists)
         except Exception as e:
             self._handle_error(e)
+        logger.info("Task created: %s", response.name)
+        return response.name
 
     sync_delay = sync_push
 
@@ -164,13 +288,16 @@ class Task(Generic[P, R]):
             return f"{self.url.rstrip('/')}/{self._func.__name__}"
         return self.url
 
-    async def _remote(self, url: str | None = None) -> None:
+    async def _remote(
+        self, url: str | None = None, headers: dict[str, str] | None = None
+    ) -> None:
         """
         Simulates Google Cloud Task execution by firing an HTTP POST request
         to the worker URL in the background without waiting for the execution response.
 
         Args:
             url (str | None): Override the task URL (useful if testing locally on a different port).
+            headers (dict | None): Final request headers (defaults to :attr:`headers`).
 
         Raises:
             ImportError: If 'httpx' is not installed.
@@ -185,9 +312,9 @@ class Task(Generic[P, R]):
 
         target_url = url or self._get_url()
         payload = json.dumps(self.data, cls=CloudTaskJSONEncoder).encode("utf-8")
-        headers = self.headers
+        headers = headers if headers is not None else self.headers
 
-        logger.info(f"⚡ Remote task dispatched: {self._func.__name__} -> {target_url}")
+        logger.info("Remote task dispatched: %s -> %s", self._func_path, target_url)
 
         async def _send():
             try:
@@ -199,18 +326,25 @@ class Task(Generic[P, R]):
                         timeout=self.timeout,
                     )
             except Exception as e:
-                logger.error(f"Failed to deliver remote task to worker: {e!s}")
+                logger.error(
+                    "Failed to deliver remote task %s to the worker: %s",
+                    self._func_path,
+                    type(e).__name__,
+                )
 
-        # Agenda no event loop e retorna imediatamente
+        # Schedule on the event loop and return immediately
         asyncio.create_task(_send())
 
-    def _remote_sync(self, url: str | None = None) -> None:
+    def _remote_sync(
+        self, url: str | None = None, headers: dict[str, str] | None = None
+    ) -> None:
         """
         Simulates Google Cloud Task execution by firing an HTTP POST request
         to the worker URL in a background thread without waiting for the execution response.
 
         Args:
             url (str | None): Override the task URL (useful if testing locally on a different port).
+            headers (dict | None): Final request headers (defaults to :attr:`headers`).
 
         Raises:
             ImportError: If 'httpx' is not installed.
@@ -225,9 +359,9 @@ class Task(Generic[P, R]):
 
         target_url = url or self._get_url()
         payload = json.dumps(self.data, cls=CloudTaskJSONEncoder).encode("utf-8")
-        headers = self.headers
+        headers = headers if headers is not None else self.headers
 
-        logger.info(f"⚡ Remote task dispatched: {self._func.__name__} -> {target_url}")
+        logger.info("Remote task dispatched: %s -> %s", self._func_path, target_url)
 
         def _send():
             try:
@@ -239,13 +373,51 @@ class Task(Generic[P, R]):
                         timeout=self.timeout,
                     )
             except Exception as e:
-                logger.error(f"Failed to deliver remote task to worker: {e!s}")
+                logger.error(
+                    "Failed to deliver remote task %s to the worker: %s",
+                    self._func_path,
+                    type(e).__name__,
+                )
 
-        # Executa na thread de segundo plano e retorna imediatamente
+        # Run in a background thread and return immediately
         thread = threading.Thread(target=_send, daemon=True)
         thread.start()
 
-    def _build_task_request_payload(self, schedule_time: datetime | None) -> dict:
+    def _build_headers(self, extra: Mapping[str, str] | None = None) -> dict[str, str]:
+        """
+        Final request headers. Precedence (lowest → highest): client ``context_headers()`` → decorator
+        ``headers`` → ``task.headers`` → ``extra`` (``push(headers=)``). The secret and ``Content-Type`` are set
+        last and can't be overridden.
+
+        Raises:
+            ValueError: A header is reserved by Cloud Tasks.
+        """
+        merged = _merge_headers(
+            self._client._get_context_headers(),
+            self._decorator_headers,
+            self._instance_headers,
+            extra,
+        )
+        _check_reserved_headers(merged, oidc=bool(self._client.sae))
+
+        library: dict[str, str] = {}
+        if self._client.secret:
+            library[self._client.secret_header_name] = self._client.secret
+        library["Content-Type"] = "application/json"
+        return _merge_headers(merged, library)
+
+    def _resolve_push_name(self, name: str | None) -> str | None:
+        if name is None:
+            return self.name
+        validate_task_name(name)
+        return name
+
+    def _build_task_request_payload(
+        self,
+        schedule_time: datetime | None,
+        headers: Mapping[str, str] | None = None,
+        name: str | None = None,
+    ) -> dict:
         """Constructs the dictionary payload expected by Google Cloud Tasks API."""
 
         # Encoding payload to JSON bytes
@@ -254,7 +426,7 @@ class Task(Generic[P, R]):
         http_request = {
             "http_method": tasks_v2.HttpMethod.POST,
             "url": self._get_url(),
-            "headers": self.headers,
+            "headers": self._build_headers(headers),
             "body": json_body,
         }
 
@@ -265,8 +437,10 @@ class Task(Generic[P, R]):
         task: dict = {"http_request": http_request}
 
         # Explicit Task Naming (Deduplication)
-        if self.name:
-            task["name"] = self.task_path
+        if name is None:
+            name = self.name
+        if name:
+            task["name"] = self._task_path(name)
 
         # Dispatch Deadline (Timeout)
         if self.timeout:
@@ -279,7 +453,8 @@ class Task(Generic[P, R]):
             # If datetime is naive (no timezone), apply the client's default timezone
             if schedule_time.tzinfo is None:
                 logger.debug(
-                    f"Received naive datetime for schedule. Applying client timezone: {self._client.timezone}"
+                    "Received naive datetime for schedule. Applying client timezone: %s",
+                    self._client.timezone,
                 )
                 schedule_time = schedule_time.replace(tzinfo=self._client.timezone)
 
@@ -292,11 +467,31 @@ class Task(Generic[P, R]):
             "task": task,
         }
 
-    def _handle_error(self, e: Exception):
-        logger.error(
-            f"Failed to push task '{self._func.__name__}'. Error: {e}", exc_info=True
-        )
-        raise exceptions.TaskPushError(str(e))
+    def _handle_already_exists(
+        self, error: Exception, name: str | None, if_exists: IfExists
+    ) -> str | None:
+        path = self._task_path(name) if name else None
+        if if_exists == "raise":
+            raise exceptions.TaskAlreadyExists(
+                f"Task {path} already exists."
+            ) from error
+        logger.info("Task %s already exists; not pushed again", path)
+        return path
+
+    def _handle_error(self, e: Exception) -> NoReturn:
+        logger.error("Failed to push task %s", self._func_path, exc_info=True)
+        raise exceptions.TaskPushError(str(e)) from e
+
+    @property
+    def name(self) -> str | None:
+        """Task name (deduplication ID). Validated against Cloud Tasks naming rules on assignment."""
+        return self._name
+
+    @name.setter
+    def name(self, value: str | None) -> None:
+        if value is not None:
+            validate_task_name(value)
+        self._name = value
 
     @property
     def data(self) -> dict[str, Any]:
@@ -310,21 +505,13 @@ class Task(Generic[P, R]):
 
     @property
     def headers(self) -> dict[str, str]:
-        """Constructs the headers dictionary, including custom and secret headers."""
-        headers: dict = {}
-        for name, value in self._headers.items():
-            # Standardize header keys
-            headers[name.replace("_", "-")] = str(value)
-
-        if self._client.secret:
-            headers[self._client.secret_header_name] = self._client.secret
-
-        headers["Content-Type"] = "application/json"
-        return headers
+        """The request headers (context, decorator and instance headers, plus the secret and Content-Type)."""
+        return self._build_headers()
 
     @headers.setter
-    def headers(self, headers: dict[str, str]):
-        self._headers.update(headers)
+    def headers(self, headers: Mapping[str, str]):
+        """Add instance headers (merged over the decorator headers)."""
+        self._instance_headers.update(headers)
 
     @property
     def is_coroutine(self) -> bool:
@@ -335,18 +522,20 @@ class Task(Generic[P, R]):
         """Returns the fully qualified dot-path of the function."""
         return self._func_path
 
+    def _task_path(self, name: str) -> str:
+        return self._client.service_utils.task_path(
+            self._client.project,
+            self._client.location,
+            self._client.force_to_queue or self.queue,
+            name,
+        )
+
     @property
     def task_path(self) -> str | None:
         """Returns the full GCP Resource path for the task name."""
         if self._client.eager or not self.name:
             return None
-
-        return self._client.service_utils.task_path(
-            self._client.project,
-            self._client.location,
-            self.queue,
-            self.name,
-        )
+        return self._task_path(self.name)
 
     @property
     def queue_path(self) -> str | None:
@@ -387,6 +576,8 @@ class CloudTaskClient:
         eager: None | Literal["remote", "immediate"] = None,
         add_url_func_name_suffix: bool = False,
         insecure_allow_unauthenticated: bool = False,
+        context_headers: Callable[[], Mapping[str, str]] | None = None,
+        retry_unknown_tasks: bool = False,
     ):
         """
         Initializes the CloudTaskClient.
@@ -406,6 +597,11 @@ class CloudTaskClient:
             add_url_func_name_suffix (bool, optional): Whether to add the function name as a prefix to the URL. Defaults to False.
             insecure_allow_unauthenticated (bool, optional): Local development only. Let the worker run tasks
                 without a secret. Defaults to False.
+            context_headers (Callable | None, optional): Called on every push; returns headers to propagate to
+                the task (request id, ``traceparent``...). Lowest precedence. If it raises, the push goes on
+                without them. Defaults to None.
+            retry_unknown_tasks (bool, optional): Worker side: answer 404 (Cloud Tasks retries) instead of
+                200 "rejected" for tasks that aren't registered, e.g. during blue/green deploys. Defaults to False.
         """
         self.queue = queue
         self.location = location
@@ -419,6 +615,8 @@ class CloudTaskClient:
         self.force_to_queue = force_to_queue
         self.add_url_func_name_suffix = add_url_func_name_suffix
         self.insecure_allow_unauthenticated = insecure_allow_unauthenticated
+        self.context_headers = context_headers
+        self.retry_unknown_tasks = retry_unknown_tasks
 
         # Tasks the worker is allowed to run, keyed by their dotted path.
         self.registry: dict[str, Callable[..., Task]] = {}
@@ -434,13 +632,13 @@ class CloudTaskClient:
         self._async_client = None
 
         logger.debug(
-            f"CloudTaskClient initialized. Eager: {eager}, Timezone: {self.timezone}"
+            "CloudTaskClient initialized. Eager: %s, Timezone: %s", eager, self.timezone
         )
 
     def task(
         self,
         queue: str | None = None,
-        name: str | None = None,
+        name: TaskName | None = None,
         url: str | None = None,
         timeout: int | None = None,
         headers: dict[str, str] | None = None,
@@ -450,19 +648,36 @@ class CloudTaskClient:
 
         Args:
             queue (str | None, optional): Override default queue.
-            name (str | None, optional): Explicit task name/ID.
+            name (str | Callable | None, optional): Task name (deduplication ID) for each call. A template
+                formatted with the call's arguments (``"expire-order-{order_id}"``) or a callable receiving them
+                as keyword arguments. A static name is shared by every call (only the first push succeeds).
             url (str | None, optional): Override default target URL.
             timeout (int | None, optional): Override default timeout.
             headers (dict | None, optional): Add specific headers.
-            add_url_func_name_suffix (bool, optional): Whether to add the function name as a prefix to the URL. Defaults to False.
 
         Returns:
             Callable: The decorated function which returns a Task object when called.
         """
 
         def decorator(func: Callable[P, R]) -> Callable[P, Task[P, R]]:
+            path = task_path_of(func)
+            signature = inspect.signature(func)
+            static_name = isinstance(name, str) and not _template_fields(name)
+            if static_name:
+                validate_task_name(name)
+                logger.warning(
+                    "Task %s has a static name: every call shares it, so only the first push is accepted. "
+                    "Use a template such as 'name-{arg}' or a callable.",
+                    path,
+                )
+
             @wraps(func)
             def inner(*args: P.args, **kwargs: P.kwargs) -> Task[P, R]:
+                task_name = (
+                    name
+                    if static_name or name is None
+                    else _render_task_name(name, signature, args, kwargs)
+                )
                 return Task(
                     func=func,
                     func_args=args,
@@ -470,16 +685,29 @@ class CloudTaskClient:
                     queue=queue or self.queue,
                     url=url or self.url,
                     timeout=timeout or self.timeout,
-                    name=name,
+                    name=task_name,
                     headers=headers,
                     client=self,
                     add_url_func_name_suffix=self.add_url_func_name_suffix,
                 )
 
-            self._register(task_path_of(func), inner)
+            self._register(path, inner)
             return inner
 
         return decorator
+
+    def _get_context_headers(self) -> Mapping[str, str]:
+        """Call the ``context_headers`` provider; a failing provider never blocks the push."""
+        if self.context_headers is None:
+            return {}
+        try:
+            return dict(self.context_headers())
+        except Exception as e:
+            logger.warning(
+                "context_headers provider failed (%s); pushing without context headers.",
+                type(e).__name__,
+            )
+            return {}
 
     def _register(self, path: str, factory: Callable[..., Task]) -> None:
         if path in self.registry:

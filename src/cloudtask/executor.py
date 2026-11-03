@@ -9,8 +9,25 @@ except ImportError:
     async_to_sync = None
 
 from cloudtask import CloudTaskClient, Task, exceptions
+from cloudtask.core import task_path_of
 
 logger = logging.getLogger("cloudtask.executor")
+
+# Raised on purpose by tasks or by payload validation: never wrapped into TaskExecutionError.
+CONTROL_FLOW_EXCEPTIONS = (
+    exceptions.TaskAbort,
+    exceptions.TaskRetry,
+    exceptions.InvalidTaskPayload,
+)
+
+
+def _log_control_flow(path: str, error: Exception) -> None:
+    if isinstance(error, exceptions.TaskAbort):
+        logger.warning("Task %s aborted: %s", path, error.reason)
+    elif isinstance(error, exceptions.TaskRetry):
+        logger.info("Task %s asked for a retry", path)
+    else:
+        logger.error("Task %s rejected: %s", path, error)
 
 
 class CloudTaskExecutor:
@@ -30,33 +47,54 @@ class CloudTaskExecutor:
         self.client = client
         self.authenticator = client.authenticator
 
-    async def run(self, body: dict[str, Any], headers: Mapping[str, str]) -> Any:
+    async def run(self, body: Any, headers: Mapping[str, str]) -> Any:
         """Async entrypoint (For FastAPI/ASGI)."""
         self.authenticator.authenticate(headers)
         func, args, kwargs = self._prepare_execution(body)
         return await self._execute_impl(func, args, kwargs)
 
-    def sync_run(self, body: dict[str, Any], headers: Mapping[str, str]) -> Any:
+    def sync_run(self, body: Any, headers: Mapping[str, str]) -> Any:
         """Sync entrypoint (For Django WSGI/Flask)."""
         self.authenticator.authenticate(headers)
         func, args, kwargs = self._prepare_execution(body)
         return self._sync_execute_impl(func, args, kwargs)
 
-    def _prepare_execution(self, body: dict[str, Any]):
-        """Extract the task path and arguments from an authenticated request and resolve the task."""
-        try:
-            func_path: str = body["path"]
-            func_args: list[Any] = body.get("args", [])
-            func_kwargs: dict[str, Any] = body.get("kwargs", {})
-        except KeyError as e:
-            msg = f"Invalid payload: missing field {e!s}"
-            logger.error(msg)
-            raise exceptions.TaskExecutionError(msg)
+    def _prepare_execution(self, body: Any):
+        """
+        Extract the task path and arguments from an authenticated request and resolve the task.
+
+        Raises:
+            InvalidTaskPayload: The body is malformed or its arguments don't fit the task's signature.
+            TaskNotFound: The path is not a registered task.
+        """
+        if not isinstance(body, dict):
+            raise self._invalid("body must be a JSON object")
+        func_path = body.get("path")
+        func_args = body.get("args", [])
+        func_kwargs = body.get("kwargs", {})
+        if not isinstance(func_path, str) or not func_path:
+            raise self._invalid("missing field 'path'")
+        if not isinstance(func_args, list):
+            raise self._invalid("'args' must be a list")
+        if not isinstance(func_kwargs, dict):
+            raise self._invalid("'kwargs' must be an object")
 
         logger.info("Processing task: %s", func_path)
 
         func = self.resolve_function(func_path)
+        try:
+            # Partial: FastAPI dependencies are filled in later.
+            inspect.signature(func).bind_partial(*func_args, **func_kwargs)
+        except TypeError as e:
+            raise self._invalid(
+                f"arguments don't match task '{func_path}': {e}"
+            ) from None
         return func, func_args, func_kwargs
+
+    @staticmethod
+    def _invalid(reason: str) -> exceptions.InvalidTaskPayload:
+        logger.error("Invalid task payload: %s", reason)
+        return exceptions.InvalidTaskPayload(f"Invalid payload: {reason}")
 
     def resolve_function(self, path: str) -> Callable[..., Task]:
         """
@@ -84,8 +122,11 @@ class CloudTaskExecutor:
         """Internal execution logic for Async Context."""
         try:
             return await self._call(func, args, kwargs)
+        except CONTROL_FLOW_EXCEPTIONS as e:
+            _log_control_flow(task_path_of(func), e)
+            raise
         except Exception as e:
-            logger.exception("Async task failed: %s", func.__name__)
+            logger.exception("Async task failed: %s", task_path_of(func))
             raise exceptions.TaskExecutionError(str(e)) from e
 
     @staticmethod
@@ -107,6 +148,11 @@ class CloudTaskExecutor:
                 )
             return task.execute()
 
+        except exceptions.TaskExecutionError:
+            raise
+        except CONTROL_FLOW_EXCEPTIONS as e:
+            _log_control_flow(task_path_of(func), e)
+            raise
         except Exception as e:
-            logger.exception("Sync task failed: %s", func.__name__)
+            logger.exception("Sync task failed: %s", task_path_of(func))
             raise exceptions.TaskExecutionError(str(e)) from e

@@ -5,18 +5,24 @@ from contextlib import AsyncExitStack, contextmanager
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.dependencies.models import Dependant
 from fastapi.dependencies.utils import get_dependant, solve_dependencies
 from pydantic import BaseModel
 
 from cloudtask import CloudTaskClient, exceptions
-from cloudtask.executor import CloudTaskExecutor
+from cloudtask.core import task_path_of
+from cloudtask.executor import (
+    CONTROL_FLOW_EXCEPTIONS,
+    CloudTaskExecutor,
+    _log_control_flow,
+)
 
 logger = logging.getLogger("cloudtask.fastapi")
 
 
 class TaskRequestBody(BaseModel):
-    """Schema for the Google Cloud Task payload."""
+    """Schema for the Google Cloud Task payload (OpenAPI docs; the executor validates the body itself)."""
 
     func: str | None = None
     path: str
@@ -76,11 +82,15 @@ class FastAPICloudTaskExecutor(CloudTaskExecutor):
                     )
 
                 if solved_result.errors:
-                    logger.error(
-                        "Dependency resolution failed for task %s", func.__name__
+                    # Missing or invalid task arguments: retrying can't fix them.
+                    fields = sorted(
+                        {
+                            ".".join(map(str, err.get("loc", ())))
+                            for err in solved_result.errors
+                        }
                     )
-                    raise exceptions.TaskExecutionError(
-                        f"Dependency resolution failed for '{func.__name__}'."
+                    raise exceptions.InvalidTaskPayload(
+                        f"Invalid payload: task arguments failed validation ({', '.join(fields)})."
                     )
 
                 # merge task kwargs and resolved dependencies (dependencies win)
@@ -89,8 +99,11 @@ class FastAPICloudTaskExecutor(CloudTaskExecutor):
 
         except exceptions.TaskExecutionError:
             raise
+        except CONTROL_FLOW_EXCEPTIONS as e:
+            _log_control_flow(task_path_of(func), e)
+            raise
         except Exception as e:
-            logger.exception("Async task failed: %s", func.__name__)
+            logger.exception("Async task failed: %s", task_path_of(func))
             raise exceptions.TaskExecutionError(str(e)) from e
 
     @contextmanager
@@ -111,6 +124,14 @@ class CloudTaskRouter(APIRouter):
     FastAPI Router specialized for handling Google Cloud Tasks.
     Usage:
         app.include_router(CloudTaskRouter(client), prefix="/tasks")
+
+    Responses (Cloud Tasks retries every non-2xx response):
+
+    - 200 ``{"status": "success"}``: the task ran.
+    - 200 ``{"status": "aborted", "reason": ...}``: the task raised ``TaskAbort``; no retry.
+    - 200 ``{"status": "rejected", "error": ...}``: invalid payload or unknown task; retrying can't fix it.
+      With ``client.retry_unknown_tasks=True`` an unknown task answers 404 instead.
+    - 403: authentication failed. 503: the task raised ``TaskRetry``. 500: the task failed.
     """
 
     def __init__(self, client: CloudTaskClient, **kwargs):
@@ -118,26 +139,55 @@ class CloudTaskRouter(APIRouter):
         self.client = client
         # Fail closed at startup: refuses to build a worker without authentication.
         client.authenticator
-        self.post("", response_model=dict[str, Any])(self._run_task)
+        self.post(
+            "",
+            response_model=dict[str, Any],
+            openapi_extra={
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": TaskRequestBody.model_json_schema()
+                        }
+                    },
+                }
+            },
+        )(self._run_task)
 
-    async def _run_task(self, request: Request, body: TaskRequestBody):
+    async def _run_task(self, request: Request):
         """
         Internal handler that acts as a bridge between FastAPI and CloudTaskExecutor.
-        """
 
-        headers = dict(request.headers)
-        payload = body.model_dump()
+        The body is parsed here, not by FastAPI, so authentication runs before any payload validation.
+        """
+        try:
+            payload = await request.json()
+        except ValueError:
+            payload = None
         executor = FastAPICloudTaskExecutor(client=self.client, request=request)
 
         try:
-            result = await executor.run(body=payload, headers=headers)
-            return {"status": "success", "result": result}
+            # The result is not returned: it may not be serializable (which would turn a success into a retry)
+            # and may carry personal data.
+            await executor.run(body=payload, headers=request.headers)
+            return {"status": "success"}
 
         except exceptions.TaskAuthenticationError:
             raise HTTPException(status_code=403, detail="Invalid task credentials")
 
+        except exceptions.TaskAbort as e:
+            return {"status": "aborted", "reason": e.reason}
+
+        except exceptions.TaskRetry:
+            return JSONResponse(status_code=503, content={"status": "retry"})
+
+        except exceptions.InvalidTaskPayload as e:
+            return {"status": "rejected", "error": str(e)}
+
         except exceptions.TaskNotFound as e:
-            raise HTTPException(status_code=404, detail=str(e))
+            if self.client.retry_unknown_tasks:
+                raise HTTPException(status_code=404, detail=str(e))
+            return {"status": "rejected", "error": str(e)}
 
         except exceptions.TaskExecutionError:
             raise HTTPException(

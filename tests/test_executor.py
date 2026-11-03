@@ -72,9 +72,55 @@ async def test_task_failure_is_wrapped(client):
     assert isinstance(info.value.__cause__, RuntimeError)
 
 
-async def test_missing_path_is_invalid_payload(client):
-    with pytest.raises(exceptions.TaskExecutionError, match="missing field"):
-        await CloudTaskExecutor(client).run({"args": []}, HEADERS)
+@pytest.mark.parametrize(
+    "body",
+    [
+        None,
+        [],
+        "x",
+        {"args": []},
+        {"path": ""},
+        {"path": 1},
+        {"path": "a.b", "args": {}},
+        {"path": "a.b", "kwargs": []},
+    ],
+)
+async def test_malformed_body_is_invalid_payload(client, body):
+    with pytest.raises(exceptions.InvalidTaskPayload):
+        await CloudTaskExecutor(client).run(body, HEADERS)
+
+
+async def test_arguments_that_dont_fit_the_signature_are_invalid_payload(client):
+    called = []
+
+    @client.task()
+    def one(a):
+        called.append(a)
+
+    executor = CloudTaskExecutor(client)
+    for body in (
+        {"path": task_path_of(one), "args": [1, 2]},
+        {"path": task_path_of(one), "kwargs": {"b": 1}},
+    ):
+        with pytest.raises(exceptions.InvalidTaskPayload):
+            await executor.run(body, HEADERS)
+    assert called == []
+
+
+async def test_abort_and_retry_are_not_wrapped(client):
+    @client.task()
+    async def aborts():
+        raise exceptions.TaskAbort("already paid")
+
+    @client.task()
+    def retries():
+        raise exceptions.TaskRetry()
+
+    executor = CloudTaskExecutor(client)
+    with pytest.raises(exceptions.TaskAbort, match="already paid"):
+        await executor.run({"path": task_path_of(aborts)}, HEADERS)
+    with pytest.raises(exceptions.TaskRetry):
+        executor.sync_run({"path": task_path_of(retries)}, HEADERS)
 
 
 async def test_authentication_happens_before_resolution(client):

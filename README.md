@@ -83,11 +83,10 @@ client = CloudTaskClient(
 Use the `@client.task` decorator. You can define tasks anywhere in your code.
 
 ```python
-@client.task(queue='high-priority', name='unique-task-name')
+@client.task(queue='high-priority', name='welcome-email-{user_id}')
 async def send_welcome_email(user_id: str, email: str):
     print(f"Sending email to {email}...")
     # ... logic to send email ...
-    return "sent"
 
 ```
 
@@ -121,20 +120,77 @@ await send_welcome_email("123", "user@example.com").push(at=eta)
 
 ### Task Deduplication (Named Tasks)
 
-Google Cloud Tasks ensures that tasks with the same name are executed only once. You can set a custom name to prevent
-duplicate execution.
+Cloud Tasks accepts only one task per name, so a name per entity gives deduplication. Names may use letters,
+digits, `-` and `_` (up to 500 characters); anything else raises `ValueError` when the task is created.
 
 ```python
-# Instantiate the task wrapper first
-task = send_welcome_email("123", "user@example.com")
+# A template, formatted with the call's arguments (positional or keyword)
+@client.task(name="expire-order-{order_id}")
+async def expire_order(order_id: str): ...
 
-# Set a deterministic name (e.g., specific to the user and action)
-task.name = "welcome-email-user-123"
+# Or a callable that receives the arguments as keyword arguments
+@client.task(name=lambda order_id, **_: f"expire-order-{order_id}")
+async def expire_order(order_id: str): ...
 
-# Push to cloud
-await task.push()
-
+# Or per instance / per push
+task = expire_order("o1")
+task.name = "expire-order-o1"
+await task.push(name="expire-order-o1-retry")
 ```
+
+A static name without placeholders is shared by every call (only the first push is accepted), so the decorator
+logs a warning for it.
+
+When the name is taken, `push()` logs it and returns the existing task path: the task is already scheduled.
+Pass `if_exists="raise"` to get `TaskAlreadyExists` (a `TaskPushError`) instead. Cloud Tasks keeps a name reserved
+for about an hour after its task ran or was deleted.
+
+### Context Headers (request id, tracing)
+
+Headers captured at push time link the task to the request that created it. `context_headers` is called on every
+push (Cloud Tasks and `remote` mode); the library doesn't depend on any tracing package:
+
+```python
+from opentelemetry import propagate
+
+
+def context_headers() -> dict[str, str]:
+    carrier: dict[str, str] = {}
+    propagate.inject(carrier)  # traceparent, tracestate, baggage
+    if request_id := get_request_id():
+        carrier["X-Request-ID"] = request_id
+    return carrier
+
+
+client = CloudTaskClient(..., context_headers=context_headers)
+```
+
+Precedence (lowest → highest): `context_headers()` → decorator `headers` → `task.headers` → `push(headers=)`.
+The secret header and `Content-Type` are set last and can't be overridden. Headers Cloud Tasks reserves (`Host`,
+`Content-Length`, `User-Agent`, `X-Google-*`, `X-AppEngine-*`, `X-CloudTasks-*`, and `Authorization` when `sae` is
+set) raise `ValueError`. If the provider raises, the push goes on without its headers (a warning is logged).
+
+On the worker, your middleware and tracing integrations read these headers as for any request.
+
+### Stopping Retries (`TaskAbort`, `TaskRetry`)
+
+Cloud Tasks retries every non-2xx response. When a task can never succeed, raise `TaskAbort`: the worker answers
+200 and Cloud Tasks stops.
+
+```python
+from cloudtask import TaskAbort
+
+
+@client.task(name="expire-order-{order_id}")
+async def expire_order(order_id: str, db: AsyncSession = Depends(get_db)):
+    order = await db.get(Order, order_id)
+    if order is None or order.paid:
+        raise TaskAbort("order missing or already paid")  # logged and returned; no personal data
+    ...
+```
+
+`TaskAbort` is an exception, so `yield` dependencies see it (a DB session rolls back). `TaskRetry` asks for a
+retry (503) without an error log; the delay is the queue's backoff.
 
 ### Local Development (Eager Modes)
 
@@ -187,6 +243,20 @@ app = FastAPI()
 app.include_router(CloudTaskRouter(client), prefix="/tasks")
 
 ```
+
+Worker responses (remember that Cloud Tasks retries every non-2xx response):
+
+| Situation | Response |
+|---|---|
+| Task ran | 200 `{"status": "success"}` (the return value is not sent back) |
+| Task raised `TaskAbort` | 200 `{"status": "aborted", "reason": ...}` |
+| Invalid payload or unknown task | 200 `{"status": "rejected", "error": ...}` (404 with `retry_unknown_tasks=True`) |
+| Wrong or missing secret | 403 |
+| Task raised `TaskRetry` | 503 |
+| Task failed | 500 |
+
+`retry_unknown_tasks=True` keeps unknown tasks retrying, useful when a deploy may route a task to code that
+doesn't have it yet.
 
 ### 2. Use `Depends` in Tasks
 
