@@ -1,7 +1,6 @@
 name: Publish to PyPI
 
-# Este workflow só vai rodar quando criares uma nova Release no GitHub
-# ou quando fizeres push de uma tag (ex: git tag v1.0.0 && git push --tags)
+# Runs when a version tag is pushed (e.g. git tag v1.0.0 && git push --tags).
 on:
   push:
     tags:
@@ -13,8 +12,8 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
-      id-token: write  # Necessário para o PyPI confiar no GitHub
-      contents: read   # Necessário para fazer o checkout do código
+      id-token: write  # Trusted publishing: lets PyPI trust this workflow
+      contents: read   # Needed to check out the code
 
     steps:
       - name: Checkout Code
@@ -33,8 +32,11 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras --dev
 
-      #      - name: Run Tests
-      #        run: uv run pytest tests/
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Run tests
+        run: uv run pytest
 
       - name: Build Package
         run: uv build

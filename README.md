@@ -68,9 +68,9 @@ client = CloudTaskClient(
     project="my-gcp-project",
     location="europe-west1",
     queue="default",
-    url="[https://api.myapp.com/tasks/run](https://api.myapp.com/tasks/run)",  # The public URL of your worker
+    url="https://api.myapp.com/tasks/run",  # The public URL of your worker
     sae="my-service-account@my-gcp-project.iam.gserviceaccount.com",  # Service Account email for OIDC auth
-    secret="super-secret-token",  # Optional: Header secret for extra security
+    secret="super-secret-token",  # Required by the worker (see Security)
     force_to_queue=None,  # Optional: Force all tasks to a specific queue (useful for Staging)
     eager=None,  # None = Production (Sends to Google Cloud)
     add_url_func_name_suffix=False # url = /tasks => /tasks/{task_func_name}
@@ -178,7 +178,7 @@ The default behavior. Serializes the task and sends it to Google Cloud Tasks.
 
 ```python
 from fastapi import FastAPI
-from cloudtask.fastapi import CloudTaskRouter
+from cloudtask.ext.fastapi import CloudTaskRouter
 from app.core.tasks import client
 
 app = FastAPI()
@@ -224,19 +224,40 @@ await process_order(order_id=500).push()
 
 ## Security
 
-To ensure that only Google Cloud Tasks can call your worker endpoint, the library supports two mechanisms:
+The worker endpoint is reachable from the internet, so the worker side is strict by default.
 
-1. **OIDC Token (Recommended):** The library automatically attaches an OIDC token identifying the Service Account. Your
-   Cloud Run/Functions service should validate this token (Google handles this automatically for Cloud Run if you don't
-   allow unauthenticated invocations).
-2. **Secret Header:** You can configure a shared secret.
+### Only registered tasks run
+
+`@client.task` registers the function in `client.registry` under its dotted path (`module.qualname`). The worker
+looks the requested path up in the registry and **never imports anything from request data**; an unknown path is
+rejected with `TaskNotFound`.
+
+Tasks register when their module is imported, so the worker process must import its task modules at startup. If
+nothing else imports them, use:
+
+```python
+client.autodiscover("app.tasks")  # imports app.tasks and all its submodules
+```
+
+### The worker fails closed
+
+Creating a `CloudTaskRouter` (or a `CloudTaskExecutor`) raises `ImproperlyConfigured` unless a shared secret is
+configured. The producer sends it in the `X-PYCT-SECRET` header (name configurable with `secret_header_name`) and
+the worker compares it in constant time:
 
 ```python
 client = CloudTaskClient(..., secret="my-secret-key")
-
 ```
 
-The router will automatically validate the `X-PYCT-SECRET` header and reject unauthorized requests (403 Forbidden).
+Producers that only push tasks don't need it to build tasks; the check runs when the worker is created.
+
+The OIDC token Cloud Tasks attaches when `sae` is set is not verified by the library. It only protects the
+endpoint when Cloud Run itself requires authentication (IAM invoker); the secret is still required.
+
+For local development only, `insecure_allow_unauthenticated=True` lets the worker run without a secret (it logs a
+warning). Never set it in a deployed environment.
+
+Authentication failures return **403 Forbidden**.
 
 ---
 

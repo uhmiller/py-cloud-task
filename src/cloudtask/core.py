@@ -1,12 +1,14 @@
 import asyncio
+import importlib
 import inspect
 import json
+import pkgutil
 import threading
 from collections.abc import Callable, Coroutine
 from datetime import datetime
 from functools import wraps
 from logging import getLogger
-from typing import Any, Generic, Literal, ParamSpec, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Literal, ParamSpec, TypeVar
 from zoneinfo import ZoneInfo
 
 from google.cloud import tasks_v2
@@ -14,6 +16,9 @@ from google.protobuf import duration_pb2, timestamp_pb2
 
 from cloudtask import exceptions
 from cloudtask.encoder import CloudTaskJSONEncoder
+
+if TYPE_CHECKING:
+    from cloudtask.auth import WorkerAuthenticator
 
 # Type aliases for better readability in decorators
 P = ParamSpec("P")
@@ -66,7 +71,7 @@ class Task(Generic[P, R]):
         self._headers = headers or {}
 
         self._func = func
-        self._func_path = f"{func.__module__}.{func.__name__}"
+        self._func_path = task_path_of(func)
         self._func_args = func_args
         self._func_kwargs = func_kwargs
 
@@ -356,6 +361,11 @@ class Task(Generic[P, R]):
         )
 
 
+def task_path_of(func: Callable) -> str:
+    """Return the dotted path that identifies a task function (``module.qualname``)."""
+    return f"{func.__module__}.{func.__qualname__}"
+
+
 class CloudTaskClient:
     """
     Main client for configuring and creating Cloud Tasks.
@@ -376,6 +386,7 @@ class CloudTaskClient:
         force_to_queue: str | None = None,
         eager: None | Literal["remote", "immediate"] = None,
         add_url_func_name_suffix: bool = False,
+        insecure_allow_unauthenticated: bool = False,
     ):
         """
         Initializes the CloudTaskClient.
@@ -393,6 +404,8 @@ class CloudTaskClient:
             timezone (str | ZoneInfo | None, optional): Default timezone for scheduling. Defaults to UTC.
             force_to_queue (str | NOne, optional): Usefull for dev and staging env, to for use the same queue
             add_url_func_name_suffix (bool, optional): Whether to add the function name as a prefix to the URL. Defaults to False.
+            insecure_allow_unauthenticated (bool, optional): Local development only. Let the worker run tasks
+                without a secret. Defaults to False.
         """
         self.queue = queue
         self.location = location
@@ -405,6 +418,11 @@ class CloudTaskClient:
         self.secret_header_name = secret_header_name
         self.force_to_queue = force_to_queue
         self.add_url_func_name_suffix = add_url_func_name_suffix
+        self.insecure_allow_unauthenticated = insecure_allow_unauthenticated
+
+        # Tasks the worker is allowed to run, keyed by their dotted path.
+        self.registry: dict[str, Callable[..., Task]] = {}
+        self._authenticator: WorkerAuthenticator | None = None
 
         # Timezone Configuration
         if isinstance(timezone, str):
@@ -458,9 +476,56 @@ class CloudTaskClient:
                     add_url_func_name_suffix=self.add_url_func_name_suffix,
                 )
 
+            self._register(task_path_of(func), inner)
             return inner
 
         return decorator
+
+    def _register(self, path: str, factory: Callable[..., Task]) -> None:
+        if path in self.registry:
+            logger.debug("Task %s registered again; keeping the last definition.", path)
+        self.registry[path] = factory
+
+    def get_task(self, path: str) -> Callable[..., Task]:
+        """
+        Return the registered task factory for a dotted path.
+
+        Raises:
+            TaskNotFound: No task is registered under that path.
+        """
+        try:
+            return self.registry[path]
+        except KeyError:
+            raise exceptions.TaskNotFound(f"Task '{path}' is not registered.") from None
+
+    def autodiscover(self, *packages: str) -> None:
+        """
+        Import the given modules or packages (and all their submodules) so their tasks register.
+
+        The worker only runs registered tasks, and tasks register when their module is imported. Call this at
+        startup, e.g. ``client.autodiscover("myapp.tasks")``.
+        """
+        for name in packages:
+            module = importlib.import_module(name)
+            if hasattr(module, "__path__"):
+                for info in pkgutil.walk_packages(
+                    module.__path__, prefix=f"{module.__name__}."
+                ):
+                    importlib.import_module(info.name)
+
+    @property
+    def authenticator(self) -> WorkerAuthenticator:
+        """
+        Worker-side request authenticator, built (and the configuration checked) on first access.
+
+        Raises:
+            ImproperlyConfigured: The worker would accept unauthenticated requests.
+        """
+        if self._authenticator is None:
+            from cloudtask.auth import WorkerAuthenticator
+
+            self._authenticator = WorkerAuthenticator(self)
+        return self._authenticator
 
     @property
     def sync_service(self):

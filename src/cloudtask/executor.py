@@ -1,7 +1,6 @@
-import importlib
 import inspect
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 try:
@@ -18,27 +17,33 @@ class CloudTaskExecutor:
     """
     Framework-agnostic processor for incoming Cloud Tasks.
     Provides both Sync and Async execution methods.
+
+    Every request must carry the client's shared secret, and only tasks registered in the client
+    (``@client.task``) can run.
     """
 
     def __init__(self, client: CloudTaskClient):
+        """
+        Raises:
+            ImproperlyConfigured: The client has no worker authentication configured.
+        """
         self.client = client
+        self.authenticator = client.authenticator
 
-    async def run(self, body: dict[str, Any], headers: dict[str, str]) -> Any:
+    async def run(self, body: dict[str, Any], headers: Mapping[str, str]) -> Any:
         """Async entrypoint (For FastAPI/ASGI)."""
-        func, args, kwargs = self._prepare_execution(body, headers)
+        self.authenticator.authenticate(headers)
+        func, args, kwargs = self._prepare_execution(body)
         return await self._execute_impl(func, args, kwargs)
 
-    def sync_run(self, body: dict[str, Any], headers: dict[str, str]) -> Any:
+    def sync_run(self, body: dict[str, Any], headers: Mapping[str, str]) -> Any:
         """Sync entrypoint (For Django WSGI/Flask)."""
-        func, args, kwargs = self._prepare_execution(body, headers)
+        self.authenticator.authenticate(headers)
+        func, args, kwargs = self._prepare_execution(body)
         return self._sync_execute_impl(func, args, kwargs)
 
-    def _prepare_execution(self, body: dict[str, Any], headers: dict[str, str]):
-        """Shared validation and extraction logic."""
-
-        if self.client.secret:
-            self._validate_secret(headers)
-
+    def _prepare_execution(self, body: dict[str, Any]):
+        """Extract the task path and arguments from an authenticated request and resolve the task."""
         try:
             func_path: str = body["path"]
             func_args: list[Any] = body.get("args", [])
@@ -48,43 +53,39 @@ class CloudTaskExecutor:
             logger.error(msg)
             raise exceptions.TaskExecutionError(msg)
 
-        logger.info(f"Processing task: {func_path}")
+        logger.info("Processing task: %s", func_path)
 
         func = self.resolve_function(func_path)
         return func, func_args, func_kwargs
 
-    def _validate_secret(self, headers: dict[str, str]):
-        """Robust secret validation handling generic HTTP headers."""
-        expected_header = self.client.secret_header_name.lower()
+    def resolve_function(self, path: str) -> Callable[..., Task]:
+        """
+        Return the registered task factory for ``path``. Never imports anything from request data.
 
-        normalized_headers = {}
-        for k, v in headers.items():
-            key = k.lower().replace("_", "-")
-            key = key.removeprefix("http-")
-            normalized_headers[key] = v
-
-        received_secret = normalized_headers.get(expected_header)
-
-        if received_secret != self.client.secret:
-            logger.warning(
-                f"Security violation: Invalid secret. Expected '{self.client.secret_header_name}'"
-            )
-            raise exceptions.InvalidTaskSecretError("Invalid or missing task secret.")
+        Raises:
+            TaskNotFound: The path is not a registered task.
+        """
+        try:
+            return self.client.get_task(path)
+        except exceptions.TaskNotFound:
+            logger.error("Task resolution failed: %s is not a registered task", path)
+            raise
 
     @staticmethod
-    async def _execute_impl(func: Callable, args: list, kwargs: dict) -> Any:
+    async def _call(func: Callable, args: list, kwargs: dict) -> Any:
+        """Build the task and run it, awaiting async tasks. Exceptions propagate unchanged."""
+        task: Task = func(*args, **kwargs)
+        result = task.execute()
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    async def _execute_impl(self, func: Callable, args: list, kwargs: dict) -> Any:
         """Internal execution logic for Async Context."""
         try:
-            task: Task = func(*args, **kwargs)
-            result = task.execute()
-
-            if inspect.isawaitable(result):
-                return await result
-
-            return result
-
+            return await self._call(func, args, kwargs)
         except Exception as e:
-            logger.exception(f"Async Task Failed '{func.__name__}': Error: {e!s}")
+            logger.exception("Async task failed: %s", func.__name__)
             raise exceptions.TaskExecutionError(str(e)) from e
 
     @staticmethod
@@ -107,20 +108,5 @@ class CloudTaskExecutor:
             return task.execute()
 
         except Exception as e:
-            logger.exception(f"Sync Task Failed '{func.__name__}': Error: {e!s}")
+            logger.exception("Sync task failed: %s", func.__name__)
             raise exceptions.TaskExecutionError(str(e)) from e
-
-    @staticmethod
-    def resolve_function(path: str) -> Callable:
-        try:
-            if "." not in path:
-                raise ValueError("Path must be in 'module.function' format")
-
-            module_name, func_name = path.rsplit(".", 1)
-            module = importlib.import_module(module_name)
-            func = getattr(module, func_name)
-            return func
-
-        except (ImportError, AttributeError, ValueError) as e:
-            logger.error(f"Task resolution failed: {path} - {e!s}")
-            raise exceptions.TaskNotFound(f"Could not import task '{path}': {e!s}")
